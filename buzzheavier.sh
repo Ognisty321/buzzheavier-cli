@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# buzzheavier.sh: An extended CLI script to interact with Buzzheavier.io
+# buzzheavier.sh: An extended CLI script to interact with Buzzheavier.com
 #
 # Dependencies:
 #   - curl
@@ -176,7 +176,12 @@ function enhanced_curl_put() {
   shift 2
   local headers=("$@")
 
-  curl --progress-bar -o - -T "$filePath" "${headers[@]}" "$url" | cat
+  # We'll capture the JSON response in a variable to parse it afterwards.
+  local response
+  response=$(curl --progress-bar -s -T "$filePath" "${headers[@]}" "$url")
+
+  # Echo the raw JSON back to stdout so calling functions can parse it.
+  echo "$response"
 }
 
 ########################################
@@ -194,8 +199,20 @@ function upload_anon() {
   fi
 
   echo "Uploading $filePath anonymously as $fileName ..."
-  enhanced_curl_put "$filePath" \
-    "${FILE_UPLOAD_BASE}/${fileName}"
+  local response
+  response=$(enhanced_curl_put "$filePath" \
+    "${FILE_UPLOAD_BASE}/${fileName}")
+
+  echo "Server Response:"
+  echo "$response"
+
+  # Extract the 'id' from JSON and display the share link
+  local id
+  id=$(echo "$response" | jq -r '.data.id // empty')
+  if [[ -n "$id" ]]; then
+    echo "Download link: https://buzzheavier.com/$id"
+  fi
+
   echo ""
 }
 
@@ -214,9 +231,20 @@ function upload_auth() {
   token="$(get_token_argument_or_config "$tokenArg")"
 
   echo "Uploading $filePath to user directory $parentId as $fileName ..."
-  enhanced_curl_put "$filePath" \
+  local response
+  response=$(enhanced_curl_put "$filePath" \
     "${FILE_UPLOAD_BASE}/${parentId}/${fileName}" \
-    -H "Authorization: Bearer $token"
+    -H "Authorization: Bearer $token")
+
+  echo "Server Response:"
+  echo "$response"
+
+  local id
+  id=$(echo "$response" | jq -r '.data.id // empty')
+  if [[ -n "$id" ]]; then
+    echo "Download link: https://buzzheavier.com/$id"
+  fi
+
   echo ""
 }
 
@@ -232,8 +260,19 @@ function upload_loc() {
   fi
 
   echo "Uploading $filePath to location $locationId as $fileName ..."
-  enhanced_curl_put "$filePath" \
-    "${FILE_UPLOAD_BASE}/${fileName}?locationId=${locationId}"
+  local response
+  response=$(enhanced_curl_put "$filePath" \
+    "${FILE_UPLOAD_BASE}/${fileName}?locationId=${locationId}")
+
+  echo "Server Response:"
+  echo "$response"
+
+  local id
+  id=$(echo "$response" | jq -r '.data.id // empty')
+  if [[ -n "$id" ]]; then
+    echo "Download link: https://buzzheavier.com/$id"
+  fi
+
   echo ""
 }
 
@@ -256,8 +295,19 @@ function upload_note() {
   fi
 
   echo "Uploading $filePath with note ..."
-  enhanced_curl_put "$filePath" \
-    "${FILE_UPLOAD_BASE}/${fileName}?note=${encodedNote}"
+  local response
+  response=$(enhanced_curl_put "$filePath" \
+    "${FILE_UPLOAD_BASE}/${fileName}?note=${encodedNote}")
+
+  echo "Server Response:"
+  echo "$response"
+
+  local id
+  id=$(echo "$response" | jq -r '.data.id // empty')
+  if [[ -n "$id" ]]; then
+    echo "Download link: https://buzzheavier.com/$id"
+  fi
+
   echo ""
 }
 
@@ -284,9 +334,21 @@ function bulk_upload() {
     local fileName
     fileName="$(basename "$filePath")"
     echo "Bulk uploading $fileName to directory $parentId..."
-    enhanced_curl_put "$filePath" \
+
+    local response
+    response=$(enhanced_curl_put "$filePath" \
       "${FILE_UPLOAD_BASE}/${parentId}/${fileName}" \
-      -H "Authorization: Bearer $token"
+      -H "Authorization: Bearer $token")
+
+    echo "Server Response:"
+    echo "$response"
+
+    local id
+    id=$(echo "$response" | jq -r '.data.id // empty')
+    if [[ -n "$id" ]]; then
+      echo "Download link: https://buzzheavier.com/$id"
+    fi
+
     echo ""
   done
 }
