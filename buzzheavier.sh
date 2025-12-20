@@ -1,559 +1,630 @@
 #!/usr/bin/env bash
 #
-# buzzheavier.sh: An extended CLI script to interact with Buzzheavier.com
+# Buzzheavier CLI (improved)
+#   A Bash CLI for interacting with buzzheavier.com programmatically.
 #
 # Dependencies:
+#   - bash 4+
 #   - curl
-#   - jq         (optional, for pretty JSON; remove/replace if not available)
-#   - base64     (or openssl for base64 fallback)
-#   - bash 4+    (for arrays in bulk operations)
+#   - jq (optional)
+#   - base64 or openssl (for upload-note)
 #
 
 ########################################
 # Configuration & Global Variables
 ########################################
-API_BASE="https://buzzheavier.com/api"
-FILE_UPLOAD_BASE="https://w.buzzheavier.com"
+API_BASE="${BUZZHEAVIER_API_BASE:-https://buzzheavier.com/api}"
+UPLOAD_BASE="${BUZZHEAVIER_UPLOAD_BASE:-https://w.buzzheavier.com}"
+DOWNLOAD_BASE="${BUZZHEAVIER_DOWNLOAD_BASE:-https://buzzheavier.com}"
 
 CONFIG_FILE="${HOME}/.config/buzzheavier-cli/config"
 
-# If a user calls a command that requires token-based auth,
-# and they haven't provided a token, we will try to load from $CONFIG_FILE.
-ACCOUNT_ID=""  # Will be loaded from config, if present.
+ACCOUNT_ID=""     # Loaded from config (or env)
+HTTP_STATUS=""    # Set by curl wrappers
 
 ########################################
-# Helper: usage instructions
+# Helpers
 ########################################
-function usage() {
+have() { command -v "$1" >/dev/null 2>&1; }
+
+log() { printf '%s\n' "$*"; }
+warn() { printf 'Warning: %s\n' "$*" >&2; }
+err() { printf 'Error: %s\n' "$*" >&2; }
+
+die() { err "$*"; exit 1; }
+
+# Best-effort JSON pretty printer
+pretty_json() {
+  local body="$1"
+  if have jq; then
+    # jq will error on non-JSON; fall back to raw
+    printf '%s\n' "$body" | jq . 2>/dev/null || printf '%s\n' "$body"
+  else
+    printf '%s\n' "$body"
+  fi
+}
+
+# Extract `.data.id` from typical upload responses (fallback if jq missing)
+extract_upload_id() {
+  local body="$1"
+  if have jq; then
+    printf '%s\n' "$body" | jq -r '.data.id // empty' 2>/dev/null
+    return 0
+  fi
+  # Fallback: naive regex for "id":"..."; take the first match
+  printf '%s\n' "$body" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+# Minimal JSON string escaping (enough for names/notes)
+json_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+# URL-encode a string (used for query params like note=...)
+urlencode() {
+  local s="$1"
+  if have python3; then
+    python3 - "$s" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=""))
+PY
+    return 0
+  fi
+  if have jq; then
+    printf '%s' "$s" | jq -sRr @uri
+    return 0
+  fi
+  if have perl; then
+    perl -MURI::Escape -e 'print uri_escape($ARGV[0]);' "$s"
+    return 0
+  fi
+
+  # Fallback: enough for base64 strings and common ASCII
+  local out="$s"
+  out=${out//%/%25}
+  out=${out// /%20}
+  out=${out//+/%2B}
+  out=${out//\//%2F}
+  out=${out//=/%3D}
+  out=${out//$'\n'/%0A}
+  out=${out//$'\r'/%0D}
+  printf '%s' "$out"
+}
+
+########################################
+# Usage
+########################################
+usage() {
   cat <<EOF
 Usage: $(basename "$0") <command> [arguments...]
 
-Commands:
+Config:
+  set-token <account_id>
+  unset-token
+  config              Show config status (does not print the full token)
 
-  #--------------------#
-  # Config Management  #
-  #--------------------#
-
-  set-token <token>
-    Saves <token> to config so you don't have to provide it every time.
-
-  #--------------------------#
-  # Interactive Mode         #
-  #--------------------------#
-
+Interactive:
   interactive
-    Launch an interactive menu-driven mode.
 
-  #----------------------------#
-  # File Upload Endpoints      #
-  #----------------------------#
-
+Uploads:
   upload-anon <filePath> <fileName>
-    Upload <filePath> anonymously as <fileName>.
-
-  upload-auth <filePath> <parentId> <fileName> [token]
-    Upload <filePath> to a user directory (parentId). Token can be given or read from config.
-
-  upload-loc <filePath> <fileName> <locationId>
-    Upload <filePath> to a specific locationId.
-
+  upload-auth <filePath> <parentId> <fileName> [account_id]
+  upload-loc  <filePath> <fileName> <locationId>
   upload-note <filePath> <fileName> <noteString>
-    Upload <filePath> with a text note (up to 500 chars). Script base64-encodes the note.
+  bulk-upload <parentId> <file1> [file2] ...
 
-  bulk-upload <parentId> <file1> [file2] [file3] ...
-    Upload multiple files to user directory <parentId> in one command.
-
-  #--------------------#
-  # Public / Account   #
-  #--------------------#
-
+Public / Account:
   locations
-    Get file storage locations (public).
+  account [account_id]
 
-  account [token]
-    Retrieve authenticated account info. Token can be passed or read from config.
+File Manager:
+  get-root [account_id]
+  get-dir <directoryId> [account_id]
+  create-dir <name> <parentId> [account_id]
+  rename-dir <directoryId> <newName> [account_id]
+  move-dir <directoryId> <newParentId> [account_id]
+  rename-file <fileId> <newName> [account_id]
+  move-file <fileId> <newParentId> [account_id]
+  add-note-file <fileId> <noteString> [account_id]
+  delete-dir <directoryId> [account_id]
+  bulk-delete <dirId1> [dirId2] ...
 
-  #----------------------#
-  # File Manager         #
-  #----------------------#
+Convenience aliases (same underlying API endpoints):
+  ls [directoryId] [account_id]        Alias for get-root/get-dir
+  rename <id> <newName> [account_id]   Alias for rename-dir/rename-file
+  move   <id> <newParentId> [account_id] Alias for move-dir/move-file
+  help | -h | --help
 
-  get-root [token]
-    Lists the contents of the root directory.
-
-  get-dir <directoryId> [token]
-    Lists the contents of <directoryId>.
-
-  create-dir <name> <parentId> [token]
-    Create a new directory named <name> under <parentId>.
-
-  rename-dir <directoryId> <newName> [token]
-    Rename directory <directoryId> to <newName>.
-
-  move-dir <directoryId> <newParentId> [token]
-    Move directory <directoryId> under <newParentId>.
-
-  rename-file <fileId> <newName> [token]
-    Rename file <fileId> to <newName>.
-
-  move-file <fileId> <newParentId> [token]
-    Move file <fileId> under <newParentId>.
-
-  add-note-file <fileId> <noteString> [token]
-    Add/change note on <fileId>.
-
-  delete-dir <directoryId> [token]
-    Delete directory <directoryId> (including subdirectories).
-
-  bulk-delete <dirId1> [dirId2] [dirId3] ...
-    Delete multiple directories in one go.
-
-Examples:
-  $(basename "$0") set-token "YOUR_ACCOUNT_ID"
-  $(basename "$0") interactive
-
-  $(basename "$0") upload-anon ./myvideo.mp4 myvideo.mp4
-  $(basename "$0") upload-auth ./myvideo.mp4 parent123 myvideo.mp4
-  $(basename "$0") upload-note ./myvideo.mp4 myvideo.mp4 "Hello from Buzzheavier!"
-  $(basename "$0") bulk-upload parent123 ./file1.mp4 ./file2.mp4
-  $(basename "$0") locations
-  $(basename "$0") account
-  $(basename "$0") get-root
+Environment overrides:
+  BUZZHEAVIER_ACCOUNT_ID   (takes precedence over config file)
+  BUZZHEAVIER_API_BASE     (default: https://buzzheavier.com/api)
+  BUZZHEAVIER_UPLOAD_BASE  (default: https://w.buzzheavier.com)
+  BUZZHEAVIER_DOWNLOAD_BASE (default: https://buzzheavier.com)
 
 EOF
 }
 
 ########################################
-# Load token from config if it exists
+# Token handling
 ########################################
-function load_token_from_config() {
-  if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE" 2>/dev/null
+load_token_from_config() {
+  # Env var wins
+  if [[ -n "${BUZZHEAVIER_ACCOUNT_ID:-}" ]]; then
+    ACCOUNT_ID="${BUZZHEAVIER_ACCOUNT_ID}"
+    return 0
   fi
+
+  [[ -f "$CONFIG_FILE" ]] || return 0
+
+  # Parse ACCOUNT_ID=... without sourcing (avoid executing arbitrary code)
+  local line
+  line=$(grep -E '^[[:space:]]*ACCOUNT_ID=' "$CONFIG_FILE" 2>/dev/null | head -n 1 || true)
+  [[ -n "$line" ]] || return 0
+
+  line=${line#ACCOUNT_ID=}
+  # Trim surrounding quotes if present
+  line=${line#\"}; line=${line%\"}
+  line=${line#\'}; line=${line%\'}
+  ACCOUNT_ID="$line"
 }
 
-########################################
-# Set token command
-########################################
-function set_token() {
-  local newToken="$1"
-
-  if [[ -z "$newToken" ]]; then
-    echo "Error: You must provide a token."
-    exit 1
-  fi
+set_token() {
+  local newToken="${1:-}"
+  [[ -n "$newToken" ]] || die "You must provide an account id. Example: $(basename "$0") set-token YOUR_ACCOUNT_ID"
 
   mkdir -p "$(dirname "$CONFIG_FILE")"
-  echo "ACCOUNT_ID=\"$newToken\"" > "$CONFIG_FILE"
-  echo "Token saved to $CONFIG_FILE"
+  # Write as plain text for safe parsing
+  printf 'ACCOUNT_ID=%s\n' "$newToken" > "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+  log "Account ID saved to $CONFIG_FILE"
 }
 
-########################################
-# Helper to get token
-########################################
-function get_token_argument_or_config() {
-  local passedToken="$1"
-  if [[ -n "$passedToken" ]]; then
-    echo "$passedToken"
+unset_token() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    rm -f "$CONFIG_FILE"
+    log "Removed $CONFIG_FILE"
   else
-    if [[ -z "$ACCOUNT_ID" ]]; then
-      echo "Error: No token provided and none found in $CONFIG_FILE. Please run:"
-      echo "  $(basename "$0") set-token <your_token>"
-      exit 1
-    fi
-    echo "$ACCOUNT_ID"
+    log "No config file found at $CONFIG_FILE"
   fi
 }
 
-########################################
-# Enhanced Upload (Progress Bar)
-########################################
-function enhanced_curl_put() {
-  # Usage: enhanced_curl_put <filePath> <URL> [<headers...>]
-  # This wrapper uses a more verbose progress bar for uploading.
-  local filePath="$1"
-  local url="$2"
-  shift 2
-  local headers=("$@")
+get_token_argument_or_config() {
+  local passed="${1:-}"
+  if [[ -n "$passed" ]]; then
+    printf '%s' "$passed"
+    return 0
+  fi
+  if [[ -z "$ACCOUNT_ID" ]]; then
+    die "No account id provided and none found in $CONFIG_FILE. Run: $(basename "$0") set-token YOUR_ACCOUNT_ID"
+  fi
+  printf '%s' "$ACCOUNT_ID"
+}
 
-  # We'll capture the JSON response in a variable to parse it afterwards.
-  local response
-  response=$(curl --progress-bar -s -T "$filePath" "${headers[@]}" "$url")
+show_config() {
+  log "Config file: $CONFIG_FILE"
+  if [[ -n "${BUZZHEAVIER_ACCOUNT_ID:-}" ]]; then
+    log "Token source: BUZZHEAVIER_ACCOUNT_ID env var"
+    log "Account ID: (hidden) length=${#BUZZHEAVIER_ACCOUNT_ID}"
+    return 0
+  fi
 
-  # Echo the raw JSON back to stdout so calling functions can parse it.
-  echo "$response"
+  if [[ -z "$ACCOUNT_ID" ]]; then
+    log "Account ID: not set"
+    return 0
+  fi
+
+  # Mask token display
+  local tail="${ACCOUNT_ID: -4}"
+  local head="${ACCOUNT_ID:0:2}"
+  log "Token source: config file"
+  log "Account ID: ${head}…${tail} (length=${#ACCOUNT_ID})"
 }
 
 ########################################
-# File Upload Functions
+# curl wrappers (capture body + HTTP status)
 ########################################
+curl_capture() {
+  # Usage: curl_capture <curl args...>
+  # Sets global HTTP_STATUS, prints body to stdout.
+  local out rc
+  out=$(curl "$@" -w $'\n%{http_code}')
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    HTTP_STATUS=""
+    return $rc
+  fi
+  HTTP_STATUS="${out##*$'\n'}"
+  printf '%s' "${out%$'\n'*}"
+  return 0
+}
 
-# 1) Anonymous file upload
-function upload_anon() {
-  local filePath="$1"
-  local fileName="$2"
+api_call() {
+  # Usage: api_call <METHOD> <URL> [curl args...]
+  local method="$1"; shift
+  local url="$1"; shift
+  curl_capture -sS -X "$method" "$@" "$url"
+}
 
-  if [[ ! -f "$filePath" ]]; then
-    echo "Error: file does not exist: $filePath"
-    exit 1
+upload_call() {
+  # Usage: upload_call <filePath> <URL> [curl args...]
+  local filePath="$1"; shift
+  local url="$1"; shift
+  curl_capture --progress-bar -sS -T "$filePath" "$@" "$url"
+}
+
+status_ok() {
+  [[ "$1" =~ ^2[0-9][0-9]$ ]]
+}
+
+########################################
+# Uploads
+########################################
+upload_anon() {
+  local filePath="${1:-}"
+  local fileName="${2:-}"
+  [[ -n "$filePath" && -n "$fileName" ]] || die "Usage: upload-anon <filePath> <fileName>"
+  [[ -f "$filePath" ]] || die "File does not exist: $filePath"
+  (( ${#fileName} <= 500 )) || die "fileName is too long (${#fileName} > 500)"
+
+  log "Uploading (anon): $filePath -> $fileName"
+  local body
+  if ! body=$(upload_call "$filePath" "${UPLOAD_BASE}/${fileName}"); then
+    die "Upload failed (curl error)."
   fi
 
-  echo "Uploading $filePath anonymously as $fileName ..."
-  local response
-  response=$(enhanced_curl_put "$filePath" \
-    "${FILE_UPLOAD_BASE}/${fileName}")
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
 
-  echo "Server Response:"
-  echo "$response"
-
-  # Extract the 'id' from JSON and display the share link
   local id
-  id=$(echo "$response" | jq -r '.data.id // empty')
+  id=$(extract_upload_id "$body")
   if [[ -n "$id" ]]; then
-    echo "Download link: https://buzzheavier.com/$id"
+    log "Download link: ${DOWNLOAD_BASE}/${id}"
   fi
-
-  echo ""
 }
 
-# 2) Authenticated file upload
-function upload_auth() {
-  local filePath="$1"
-  local parentId="$2"
-  local fileName="$3"
-  local tokenArg="$4"
+upload_auth() {
+  local filePath="${1:-}"
+  local parentId="${2:-}"
+  local fileName="${3:-}"
+  local tokenArg="${4:-}"
+  [[ -n "$filePath" && -n "$parentId" && -n "$fileName" ]] || die "Usage: upload-auth <filePath> <parentId> <fileName> [account_id]"
+  [[ -f "$filePath" ]] || die "File does not exist: $filePath"
+  (( ${#fileName} <= 500 )) || die "fileName is too long (${#fileName} > 500)"
 
-  if [[ ! -f "$filePath" ]]; then
-    echo "Error: file does not exist: $filePath"
-    exit 1
-  fi
   local token
   token="$(get_token_argument_or_config "$tokenArg")"
 
-  echo "Uploading $filePath to user directory $parentId as $fileName ..."
-  local response
-  response=$(enhanced_curl_put "$filePath" \
-    "${FILE_UPLOAD_BASE}/${parentId}/${fileName}" \
-    -H "Authorization: Bearer $token")
+  log "Uploading (auth): $filePath -> ${parentId}/${fileName}"
+  local body
+  if ! body=$(upload_call "$filePath" "${UPLOAD_BASE}/${parentId}/${fileName}" -H "Authorization: Bearer $token"); then
+    die "Upload failed (curl error)."
+  fi
 
-  echo "Server Response:"
-  echo "$response"
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
 
   local id
-  id=$(echo "$response" | jq -r '.data.id // empty')
+  id=$(extract_upload_id "$body")
   if [[ -n "$id" ]]; then
-    echo "Download link: https://buzzheavier.com/$id"
+    log "Download link: ${DOWNLOAD_BASE}/${id}"
   fi
-
-  echo ""
 }
 
-# 3) Upload a file to a specific location
-function upload_loc() {
-  local filePath="$1"
-  local fileName="$2"
-  local locationId="$3"
+upload_loc() {
+  local filePath="${1:-}"
+  local fileName="${2:-}"
+  local locationId="${3:-}"
+  [[ -n "$filePath" && -n "$fileName" && -n "$locationId" ]] || die "Usage: upload-loc <filePath> <fileName> <locationId>"
+  [[ -f "$filePath" ]] || die "File does not exist: $filePath"
+  (( ${#fileName} <= 500 )) || die "fileName is too long (${#fileName} > 500)"
 
-  if [[ ! -f "$filePath" ]]; then
-    echo "Error: file does not exist: $filePath"
-    exit 1
+  log "Uploading (location=${locationId}): $filePath -> $fileName"
+  local body
+  if ! body=$(upload_call "$filePath" "${UPLOAD_BASE}/${fileName}?locationId=$(urlencode "$locationId")"); then
+    die "Upload failed (curl error)."
   fi
 
-  echo "Uploading $filePath to location $locationId as $fileName ..."
-  local response
-  response=$(enhanced_curl_put "$filePath" \
-    "${FILE_UPLOAD_BASE}/${fileName}?locationId=${locationId}")
-
-  echo "Server Response:"
-  echo "$response"
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
 
   local id
-  id=$(echo "$response" | jq -r '.data.id // empty')
+  id=$(extract_upload_id "$body")
   if [[ -n "$id" ]]; then
-    echo "Download link: https://buzzheavier.com/$id"
+    log "Download link: ${DOWNLOAD_BASE}/${id}"
   fi
-
-  echo ""
 }
 
-# 4) Upload a file with note
-function upload_note() {
-  local filePath="$1"
-  local fileName="$2"
-  local noteString="$3"
-
-  if [[ ! -f "$filePath" ]]; then
-    echo "Error: file does not exist: $filePath"
-    exit 1
-  fi
+upload_note() {
+  local filePath="${1:-}"
+  local fileName="${2:-}"
+  local noteString="${3:-}"
+  [[ -n "$filePath" && -n "$fileName" && -n "$noteString" ]] || die "Usage: upload-note <filePath> <fileName> <noteString>"
+  [[ -f "$filePath" ]] || die "File does not exist: $filePath"
+  (( ${#fileName} <= 500 )) || die "fileName is too long (${#fileName} > 500)"
+  (( ${#noteString} <= 500 )) || die "noteString is too long (${#noteString} > 500)"
 
   local encodedNote
-  if command -v base64 >/dev/null 2>&1; then
-    encodedNote="$(echo -n "$noteString" | base64)"
+  if have base64; then
+    # Cross-platform: remove newlines because some base64 implementations wrap output
+    encodedNote=$(printf '%s' "$noteString" | base64 | tr -d '\n')
+  elif have openssl; then
+    encodedNote=$(printf '%s' "$noteString" | openssl base64 -A)
   else
-    encodedNote="$(openssl base64 -A <<< "$noteString")"
+    die "Neither base64 nor openssl found; cannot encode note."
   fi
 
-  echo "Uploading $filePath with note ..."
-  local response
-  response=$(enhanced_curl_put "$filePath" \
-    "${FILE_UPLOAD_BASE}/${fileName}?note=${encodedNote}")
+  # Important: base64 commonly includes +/= which should be URL-encoded in query strings
+  local encodedNoteUrl
+  encodedNoteUrl=$(urlencode "$encodedNote")
 
-  echo "Server Response:"
-  echo "$response"
+  log "Uploading (with note): $filePath -> $fileName"
+  local body
+  if ! body=$(upload_call "$filePath" "${UPLOAD_BASE}/${fileName}?note=${encodedNoteUrl}"); then
+    die "Upload failed (curl error)."
+  fi
+
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
 
   local id
-  id=$(echo "$response" | jq -r '.data.id // empty')
+  id=$(extract_upload_id "$body")
   if [[ -n "$id" ]]; then
-    echo "Download link: https://buzzheavier.com/$id"
+    log "Download link: ${DOWNLOAD_BASE}/${id}"
   fi
-
-  echo ""
 }
 
-# Bulk upload multiple files into a user directory
-function bulk_upload() {
-  local parentId="$1"
-  shift
-  if [[ $# -lt 1 ]]; then
-    echo "Usage: bulk-upload <parentId> <file1> [file2] ..."
-    exit 1
-  fi
+bulk_upload() {
+  local parentId="${1:-}"
+  shift || true
+  [[ -n "$parentId" ]] || die "Usage: bulk-upload <parentId> <file1> [file2] ..."
+  [[ $# -ge 1 ]] || die "Usage: bulk-upload <parentId> <file1> [file2] ..."
 
-  # We'll attempt to use the token from config. No separate token argument here,
-  # but you can easily add [token] if needed.
   local token
   token="$(get_token_argument_or_config "")"
 
-  # For each file, we’ll keep the same file name (basename).
   for filePath in "$@"; do
     if [[ ! -f "$filePath" ]]; then
-      echo "Warning: $filePath does not exist, skipping..."
+      warn "Skipping (not a file): $filePath"
       continue
     fi
     local fileName
     fileName="$(basename "$filePath")"
-    echo "Bulk uploading $fileName to directory $parentId..."
+    (( ${#fileName} <= 500 )) || { warn "Skipping (fileName too long): $fileName"; continue; }
 
-    local response
-    response=$(enhanced_curl_put "$filePath" \
-      "${FILE_UPLOAD_BASE}/${parentId}/${fileName}" \
-      -H "Authorization: Bearer $token")
-
-    echo "Server Response:"
-    echo "$response"
-
-    local id
-    id=$(echo "$response" | jq -r '.data.id // empty')
-    if [[ -n "$id" ]]; then
-      echo "Download link: https://buzzheavier.com/$id"
+    log "Bulk uploading: $fileName -> ${parentId}/${fileName}"
+    local body
+    if ! body=$(upload_call "$filePath" "${UPLOAD_BASE}/${parentId}/${fileName}" -H "Authorization: Bearer $token"); then
+      warn "Upload failed (curl error) for: $fileName"
+      continue
     fi
 
-    echo ""
+    log "HTTP: $HTTP_STATUS"
+    pretty_json "$body"
+
+    local id
+    id=$(extract_upload_id "$body")
+    if [[ -n "$id" ]]; then
+      log "Download link: ${DOWNLOAD_BASE}/${id}"
+    fi
+    log ""
   done
 }
 
 ########################################
-# Public / Account Info
+# Public / Account
 ########################################
-
-# 5) Get file storage locations
-function get_locations() {
-  echo "Fetching file storage locations..."
-  curl -s "${API_BASE}/locations" | jq .
+get_locations() {
+  log "Fetching storage locations..."
+  local body
+  if ! body=$(api_call GET "${API_BASE}/locations"); then
+    die "Request failed (curl error)."
+  fi
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
 }
 
-# 6) Get account information
-function get_account() {
-  local tokenArg="$1"
+get_account() {
+  local tokenArg="${1:-}"
   local token
   token="$(get_token_argument_or_config "$tokenArg")"
 
-  echo "Fetching account info..."
-  curl -s \
-    -H "Authorization: Bearer $token" \
-    "${API_BASE}/account" \
-  | jq .
+  log "Fetching account info..."
+  local body
+  if ! body=$(api_call GET "${API_BASE}/account" -H "Authorization: Bearer $token"); then
+    die "Request failed (curl error)."
+  fi
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
 }
 
 ########################################
 # File Manager
 ########################################
-
-# 7) Get root directory
-function get_root() {
-  local tokenArg="$1"
+get_root() {
+  local tokenArg="${1:-}"
   local token
   token="$(get_token_argument_or_config "$tokenArg")"
 
-  echo "Listing root directory contents..."
-  curl -s \
-    -H "Authorization: Bearer $token" \
-    "${API_BASE}/fs" \
-  | jq .
-}
-
-# 8) Get directory
-function get_directory() {
-  local directoryId="$1"
-  local tokenArg="$2"
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  echo "Listing directory $directoryId..."
-  curl -s \
-    -H "Authorization: Bearer $token" \
-    "${API_BASE}/fs/${directoryId}" \
-  | jq .
-}
-
-# 9) Create directory
-function create_directory() {
-  local name="$1"
-  local parentId="$2"
-  local tokenArg="$3"
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  echo "Creating directory '$name' under parentId='$parentId'..."
-  curl -s \
-    -X POST \
-    -H "Authorization: Bearer $token" \
-    -H "Content-Type: application/json" \
-    -d "{\"name\": \"${name}\", \"parentId\": \"${parentId}\"}" \
-    "${API_BASE}/fs" \
-  | jq .
-}
-
-# 10) Rename directory
-function rename_directory() {
-  local directoryId="$1"
-  local newName="$2"
-  local tokenArg="$3"
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  echo "Renaming directory $directoryId to $newName..."
-  curl -s \
-    -X PATCH \
-    -H "Authorization: Bearer $token" \
-    -H "Content-Type: application/json" \
-    -d "{\"name\": \"${newName}\"}" \
-    "${API_BASE}/fs/${directoryId}" \
-  | jq .
-}
-
-# 11) Move directory
-function move_directory() {
-  local directoryId="$1"
-  local newParentId="$2"
-  local tokenArg="$3"
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  echo "Moving directory $directoryId to $newParentId..."
-  curl -s \
-    -X PUT \
-    -H "Authorization: Bearer $token" \
-    -H "Content-Type: application/json" \
-    -d "{\"parentId\": \"${newParentId}\"}" \
-    "${API_BASE}/fs/${directoryId}" \
-  | jq .
-}
-
-# 12) Rename file
-function rename_file() {
-  local fileId="$1"
-  local newName="$2"
-  local tokenArg="$3"
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  echo "Renaming file $fileId to $newName..."
-  curl -s \
-    -X PATCH \
-    -H "Authorization: Bearer $token" \
-    -H "Content-Type: application/json" \
-    -d "{\"name\": \"${newName}\"}" \
-    "${API_BASE}/fs/${fileId}" \
-  | jq .
-}
-
-# 13) Move file
-function move_file() {
-  local fileId="$1"
-  local newParentId="$2"
-  local tokenArg="$3"
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  echo "Moving file $fileId to $newParentId..."
-  curl -s \
-    -X PUT \
-    -H "Authorization: Bearer $token" \
-    -H "Content-Type: application/json" \
-    -d "{\"parentId\": \"${newParentId}\"}" \
-    "${API_BASE}/fs/${fileId}" \
-  | jq .
-}
-
-# 14) Add / change note for a file
-function add_note_file() {
-  local fileId="$1"
-  local noteString="$2"
-  local tokenArg="$3"
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  echo "Updating note for file $fileId..."
-  curl -s \
-    -X PUT \
-    -H "Authorization: Bearer $token" \
-    -H "Content-Type: application/json" \
-    -d "{\"note\": \"${noteString}\"}" \
-    "${API_BASE}/fs/${fileId}" \
-  | jq .
-}
-
-# 15) Delete directory
-function delete_directory() {
-  local directoryId="$1"
-  local tokenArg="$2"
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  echo "Deleting directory $directoryId..."
-  curl -s \
-    -X DELETE \
-    -H "Authorization: Bearer $token" \
-    "${API_BASE}/fs/${directoryId}" \
-  | jq .
-}
-
-# Bulk delete multiple directories
-function bulk_delete_directories() {
-  if [[ $# -lt 1 ]]; then
-    echo "Usage: bulk-delete <dirId1> [dirId2] [dirId3] ..."
-    exit 1
+  log "Listing root directory..."
+  local body
+  if ! body=$(api_call GET "${API_BASE}/fs" -H "Authorization: Bearer $token"); then
+    die "Request failed (curl error)."
   fi
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
+}
+
+get_directory() {
+  local directoryId="${1:-}"
+  local tokenArg="${2:-}"
+  [[ -n "$directoryId" ]] || die "Usage: get-dir <directoryId> [account_id]"
+
+  local token
+  token="$(get_token_argument_or_config "$tokenArg")"
+
+  log "Listing directory: $directoryId"
+  local body
+  if ! body=$(api_call GET "${API_BASE}/fs/${directoryId}" -H "Authorization: Bearer $token"); then
+    die "Request failed (curl error)."
+  fi
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
+}
+
+create_directory() {
+  local name="${1:-}"
+  local parentId="${2:-}"
+  local tokenArg="${3:-}"
+  [[ -n "$name" && -n "$parentId" ]] || die "Usage: create-dir <name> <parentId> [account_id]"
+
+  local token
+  token="$(get_token_argument_or_config "$tokenArg")"
+
+  # Official docs: POST /api/fs/{parentDirectoryId} with JSON { "name": "..." }
+  local payload
+  payload="{\"name\":\"$(json_escape "$name")\"}"
+
+  log "Creating directory '$name' under parentId='$parentId'..."
+  local body
+  if ! body=$(api_call POST "${API_BASE}/fs/${parentId}" \
+      -H "Authorization: Bearer $token" \
+      -H "Content-Type: application/json" \
+      -d "$payload"); then
+    die "Request failed (curl error)."
+  fi
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
+}
+
+rename_item() {
+  local id="${1:-}"
+  local newName="${2:-}"
+  local tokenArg="${3:-}"
+  [[ -n "$id" && -n "$newName" ]] || die "Usage: rename <id> <newName> [account_id]"
+
+  local token
+  token="$(get_token_argument_or_config "$tokenArg")"
+
+  local payload
+  payload="{\"name\":\"$(json_escape "$newName")\"}"
+
+  log "Renaming item $id -> $newName"
+  local body
+  if ! body=$(api_call PATCH "${API_BASE}/fs/${id}" \
+      -H "Authorization: Bearer $token" \
+      -H "Content-Type: application/json" \
+      -d "$payload"); then
+    die "Request failed (curl error)."
+  fi
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
+}
+
+move_item() {
+  local id="${1:-}"
+  local newParentId="${2:-}"
+  local tokenArg="${3:-}"
+  [[ -n "$id" && -n "$newParentId" ]] || die "Usage: move <id> <newParentId> [account_id]"
+
+  local token
+  token="$(get_token_argument_or_config "$tokenArg")"
+
+  local payload
+  payload="{\"parentId\":\"$(json_escape "$newParentId")\"}"
+
+  log "Moving item $id -> parent $newParentId"
+  local body
+  if ! body=$(api_call PUT "${API_BASE}/fs/${id}" \
+      -H "Authorization: Bearer $token" \
+      -H "Content-Type: application/json" \
+      -d "$payload"); then
+    die "Request failed (curl error)."
+  fi
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
+}
+
+add_note_file() {
+  local fileId="${1:-}"
+  local noteString="${2:-}"
+  local tokenArg="${3:-}"
+  [[ -n "$fileId" && -n "$noteString" ]] || die "Usage: add-note-file <fileId> <noteString> [account_id]"
+
+  local token
+  token="$(get_token_argument_or_config "$tokenArg")"
+
+  local payload
+  payload="{\"note\":\"$(json_escape "$noteString")\"}"
+
+  log "Updating note for file $fileId..."
+  local body
+  if ! body=$(api_call PUT "${API_BASE}/fs/${fileId}" \
+      -H "Authorization: Bearer $token" \
+      -H "Content-Type: application/json" \
+      -d "$payload"); then
+    die "Request failed (curl error)."
+  fi
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
+}
+
+delete_directory() {
+  local directoryId="${1:-}"
+  local tokenArg="${2:-}"
+  [[ -n "$directoryId" ]] || die "Usage: delete-dir <directoryId> [account_id]"
+
+  local token
+  token="$(get_token_argument_or_config "$tokenArg")"
+
+  log "Deleting directory: $directoryId"
+  local body
+  if ! body=$(api_call DELETE "${API_BASE}/fs/${directoryId}" -H "Authorization: Bearer $token"); then
+    die "Request failed (curl error)."
+  fi
+  log "HTTP: $HTTP_STATUS"
+  pretty_json "$body"
+}
+
+bulk_delete_directories() {
+  [[ $# -ge 1 ]] || die "Usage: bulk-delete <dirId1> [dirId2] ..."
 
   local token
   token="$(get_token_argument_or_config "")"
 
   for dirId in "$@"; do
-    echo "Deleting directory: $dirId"
-    curl -s \
-      -X DELETE \
-      -H "Authorization: Bearer $token" \
-      "${API_BASE}/fs/${dirId}" \
-    | jq .
+    log "Deleting directory: $dirId"
+    local body
+    if ! body=$(api_call DELETE "${API_BASE}/fs/${dirId}" -H "Authorization: Bearer $token"); then
+      warn "Request failed (curl error) for: $dirId"
+      continue
+    fi
+    log "HTTP: $HTTP_STATUS"
+    pretty_json "$body"
   done
 }
 
+# Convenience alias: ls [id]
+ls_cmd() {
+  local maybeId="${1:-}"
+  local tokenArg="${2:-}"
+
+  if [[ -z "$maybeId" ]]; then
+    get_root "$tokenArg"
+  else
+    get_directory "$maybeId" "$tokenArg"
+  fi
+}
+
 ########################################
-# Interactive Menu
+# Interactive Menu (kept mostly the same)
 ########################################
-function interactive_menu() {
+interactive_menu() {
   while true; do
     echo
     echo "========== Buzzheavier CLI Interactive Menu =========="
@@ -567,39 +638,35 @@ function interactive_menu() {
     echo " 8) Delete Directory"
     echo " 9) Bulk Delete Directories"
     echo "10) Get Storage Locations"
-    echo "11) Quit"
+    echo "11) Show Config"
+    echo "12) Quit"
     echo "======================================================"
-    read -rp "Choose an option (1-11): " choice
+    read -rp "Choose an option (1-12): " choice
 
     case "$choice" in
       1)
-        echo -n "Enter new token: "
-        read -r newTok
+        read -rsp "Enter new account id: " newTok
+        echo
         set_token "$newTok"
+        load_token_from_config
         ;;
       2)
         get_account
         ;;
       3)
-        echo -n "Enter file path: "
-        read -r anonPath
-        echo -n "Enter file name as stored: "
-        read -r anonName
+        read -rp "Enter file path: " anonPath
+        read -rp "Enter file name as stored: " anonName
         upload_anon "$anonPath" "$anonName"
         ;;
       4)
-        echo -n "Enter file path: "
-        read -r authPath
-        echo -n "Enter parentId: "
-        read -r pId
-        echo -n "Enter file name as stored: "
-        read -r fName
+        read -rp "Enter file path: " authPath
+        read -rp "Enter parentId: " pId
+        read -rp "Enter file name as stored: " fName
         upload_auth "$authPath" "$pId" "$fName"
         ;;
       5)
-        echo -n "Enter parentId for bulk upload: "
-        read -r bParent
-        echo -n "Enter paths for files to upload (space-separated): "
+        read -rp "Enter parentId for bulk upload: " bParent
+        echo "Enter paths for files to upload (space-separated): "
         read -ra fileArray
         bulk_upload "$bParent" "${fileArray[@]}"
         ;;
@@ -607,19 +674,16 @@ function interactive_menu() {
         get_root
         ;;
       7)
-        echo -n "Enter new directory name: "
-        read -r newDirName
-        echo -n "Enter parentId: "
-        read -r cParent
+        read -rp "Enter new directory name: " newDirName
+        read -rp "Enter parentId: " cParent
         create_directory "$newDirName" "$cParent"
         ;;
       8)
-        echo -n "Enter directoryId to delete: "
-        read -r dId
+        read -rp "Enter directoryId to delete: " dId
         delete_directory "$dId"
         ;;
       9)
-        echo -n "Enter directoryIds to bulk-delete (space-separated): "
+        echo "Enter directoryIds to bulk-delete (space-separated): "
         read -ra dirArray
         bulk_delete_directories "${dirArray[@]}"
         ;;
@@ -627,11 +691,14 @@ function interactive_menu() {
         get_locations
         ;;
       11)
-        echo "Exiting Interactive Mode."
+        show_config
+        ;;
+      12)
+        log "Exiting Interactive Mode."
         break
         ;;
       *)
-        echo "Invalid choice."
+        warn "Invalid choice."
         ;;
     esac
   done
@@ -640,110 +707,108 @@ function interactive_menu() {
 ########################################
 # Main
 ########################################
-
-# 1) Load token from config if available
 load_token_from_config
 
-# 2) Handle user command
 if [[ $# -lt 1 ]]; then
   usage
   exit 1
 fi
 
 COMMAND="$1"
-shift
+shift || true
 
 case "$COMMAND" in
+  help|-h|--help)
+    usage
+    ;;
+
   # Config
   set-token)
-    # usage: set-token <token>
-    set_token "$@"
+    set_token "${1:-}"
     ;;
-  
+  unset-token)
+    unset_token
+    ;;
+  config)
+    show_config
+    ;;
+
   # Interactive Mode
   interactive)
     interactive_menu
     ;;
 
-  # File Upload Endpoints
+  # Uploads
   upload-anon)
-    # usage: upload-anon <filePath> <fileName>
     upload_anon "$@"
     ;;
   upload-auth)
-    # usage: upload-auth <filePath> <parentId> <fileName> [token]
     upload_auth "$@"
     ;;
   upload-loc)
-    # usage: upload-loc <filePath> <fileName> <locationId>
     upload_loc "$@"
     ;;
   upload-note)
-    # usage: upload-note <filePath> <fileName> <noteString>
     upload_note "$@"
     ;;
   bulk-upload)
-    # usage: bulk-upload <parentId> <file1> [file2] ...
     bulk_upload "$@"
     ;;
 
   # Public / Account
   locations)
-    # usage: locations
     get_locations
     ;;
   account)
-    # usage: account [token]
     get_account "$@"
     ;;
 
-  # File Manager
+  # File Manager (original names)
   get-root)
-    # usage: get-root [token]
     get_root "$@"
     ;;
   get-dir)
-    # usage: get-dir <directoryId> [token]
     get_directory "$@"
     ;;
   create-dir)
-    # usage: create-dir <name> <parentId> [token]
     create_directory "$@"
     ;;
   rename-dir)
-    # usage: rename-dir <directoryId> <newName> [token]
-    rename_directory "$@"
+    rename_item "$@"
     ;;
   move-dir)
-    # usage: move-dir <directoryId> <newParentId> [token]
-    move_directory "$@"
+    move_item "$@"
     ;;
   rename-file)
-    # usage: rename-file <fileId> <newName> [token]
-    rename_file "$@"
+    rename_item "$@"
     ;;
   move-file)
-    # usage: move-file <fileId> <newParentId> [token]
-    move_file "$@"
+    move_item "$@"
     ;;
   add-note-file)
-    # usage: add-note-file <fileId> <noteString> [token]
     add_note_file "$@"
     ;;
   delete-dir)
-    # usage: delete-dir <directoryId> [token]
     delete_directory "$@"
     ;;
   bulk-delete)
-    # usage: bulk-delete <dirId1> [dirId2] [dirId3] ...
     bulk_delete_directories "$@"
     ;;
 
+  # Convenience aliases
+  ls)
+    ls_cmd "$@"
+    ;;
+  rename)
+    rename_item "$@"
+    ;;
+  move)
+    move_item "$@"
+    ;;
+
   *)
-    echo "Unknown command: $COMMAND"
+    err "Unknown command: $COMMAND"
     usage
     exit 1
     ;;
 esac
-
-exit 0
