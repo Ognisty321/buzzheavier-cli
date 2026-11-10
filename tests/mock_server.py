@@ -26,7 +26,8 @@ LISTING = {
         "name": "Root",
         "isDirectory": True,
         "children": [
-            {"id": "file00000001", "name": "zeta.bin", "isDirectory": False, "size": 1536},
+            {"id": "file00000001", "name": "zeta.bin", "isDirectory": False, "size": 1536,
+             "downloads": 7, "createdAt": "2025-12-31T15:51:10.553152Z", "note": ""},
             {"id": "dir000000001", "name": "Movies", "isDirectory": True},
             {"id": "file00000002", "name": "alpha zażółć.txt", "isDirectory": False, "size": 12},
             {"id": "file00000003", "name": "big.iso", "isDirectory": False, "size": 5368709120},
@@ -119,9 +120,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.command == "POST":
                 name = json.loads(body)["name"]
                 return self._send(201, {"code": 201, "data": {"id": "newdir000001", "name": name}})
-            if self.command in ("PATCH", "PUT"):
+            if self.command == "PATCH":
                 json.loads(body)
-                return self._send(200, {"code": 200})
+                return self._send(200, {"code": 200, "data": None})
+            if self.command == "PUT":  # documented for move/note, but the real server refuses it
+                return self._send(405, {"code": 405, "error": "Method Not Allowed"})
             if self.command == "DELETE":
                 return self._send(200, {"code": 200})
         return self._send(404, {"code": 404, "error": "Not Found"})

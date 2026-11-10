@@ -602,7 +602,7 @@ cmd_account() {
         | if type != "object" then error("unexpected shape") else . end
         | to_entries[]
         | select((.value | type) != "object" and (.value | type) != "array")
-        | ["\(.key):", (.value | tostring)] | @tsv' 2>/dev/null) \
+        | ["\(.key):", (.value | if . == null then "-" else tostring end)] | @tsv' 2>/dev/null) \
       && [[ -n "$rows" ]]; then
     print_table "" <<<"$rows"
   else
@@ -636,6 +636,8 @@ render_listing() {
       | [ (if isdir then "dir" else "file" end),
           (.id // "-" | tostring),
           (if isdir then "-" else (.size | hs) end),
+          (if isdir then "-" else (.downloads // "-" | tostring) end),
+          (.createdAt // "-" | tostring | .[0:10]),
           ((.name // "" | tostring) + (if isdir then "/" else "" end)) ]
       | @tsv' 2>/dev/null); then
     print_json
@@ -651,7 +653,14 @@ render_listing() {
     hint "(empty directory)"
     return 0
   fi
-  print_table $'TYPE\tID\tSIZE\tNAME' <<<"$rows"
+  print_table $'TYPE\tID\tSIZE\tDL\tCREATED\tNAME' <<<"$rows"
+
+  local cursor
+  cursor=$(printf '%s\n' "$RESP_BODY" | jq -r '.data.nextCursor? // empty' 2>/dev/null)
+  if [[ -n "$cursor" ]]; then
+    warn "More entries exist: the API returned only the first page of this directory."
+  fi
+  return 0
 }
 
 # ls [directoryId] [account_id]
@@ -702,10 +711,11 @@ cmd_rename() {
 }
 
 # mv <id> <newParentId> [account_id]
+# The API docs say PUT for move and note, but the server only accepts PATCH.
 cmd_move() {
   (( $# >= 2 )) && [[ -n "$1" && -n "$2" ]] || die_usage "mv <id> <newParentId>"
   resolve_token "${3:-}"
-  api PUT "/fs/$(urlencode "$1")" "$TOKEN" "{\"parentId\":\"$(json_escape "$2")\"}" || return 1
+  api PATCH "/fs/$(urlencode "$1")" "$TOKEN" "{\"parentId\":\"$(json_escape "$2")\"}" || return 1
   (( OPT_JSON )) && print_json
   ok "Moved $1 ${SYM_ARROW} directory $2"
 }
@@ -714,7 +724,7 @@ cmd_move() {
 cmd_note() {
   (( $# >= 2 )) && [[ -n "$1" ]] || die_usage "note <fileId> <text>"
   resolve_token "${3:-}"
-  api PUT "/fs/$(urlencode "$1")" "$TOKEN" "{\"note\":\"$(json_escape "$2")\"}" || return 1
+  api PATCH "/fs/$(urlencode "$1")" "$TOKEN" "{\"note\":\"$(json_escape "$2")\"}" || return 1
   (( OPT_JSON )) && print_json
   ok "Note updated for $1"
 }
@@ -723,9 +733,9 @@ cmd_note() {
 delete_dirs() {
   local id failed=0 question
   if (( $# == 1 )); then
-    question="Delete directory $1 and everything inside it?"
+    question="Delete $1? (a directory is deleted with everything inside it)"
   else
-    question="Delete $# directories and everything inside them?"
+    question="Delete $# items? (directories are deleted with everything inside them)"
   fi
   if ! confirm "$question"; then
     hint "Aborted, nothing was deleted."
@@ -743,9 +753,9 @@ delete_dirs() {
   (( failed == 0 ))
 }
 
-# rm <dirId>...
+# rm <id>...   (the API deletes files as well as directories)
 cmd_rm() {
-  (( $# >= 1 )) || die_usage "rm <dirId>..."
+  (( $# >= 1 )) || die_usage "rm <id>..."
   resolve_token ""
   delete_dirs "$@"
 }
@@ -806,7 +816,7 @@ ${C_BOLD}Buzzheavier CLI${C_RST} ${C_DIM}v${VERSION} - account ID: ${acct}${C_RS
    6) Rename file or directory
    7) Move file or directory
    8) Set a file note
-   9) Delete directory
+   9) Delete file or directory
  ${C_CYAN}Account${C_RST}
   10) Account info
   11) Storage locations
@@ -864,7 +874,7 @@ EOF
         ( cmd_note "$a" "$ASK_REPLY" )
         ;;
       9)
-        ask "Directory id to delete: " || break
+        ask "Id of the file or directory to delete: " || break
         ( cmd_delete_dir "$ASK_REPLY" )
         ;;
       10) ( cmd_account ) ;;
@@ -905,7 +915,7 @@ ${O_BOLD}FILE MANAGER${O_RST} ${O_DIM}(needs account ID)${O_RST}
   ${O_CYAN}rename${O_RST} <id> <newName>         Rename a file or directory
   ${O_CYAN}mv${O_RST} <id> <newParentId>         Move a file or directory
   ${O_CYAN}note${O_RST} <fileId> <text>          Set or replace the note of a file
-  ${O_CYAN}rm${O_RST} <dirId>...                 Delete directories including their contents
+  ${O_CYAN}rm${O_RST} <id>...                    Delete files or directories (with their contents)
 
 ${O_BOLD}ACCOUNT & SETUP${O_RST}
   ${O_CYAN}account${O_RST}                       Show account information

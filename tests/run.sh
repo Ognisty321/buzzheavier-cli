@@ -208,11 +208,12 @@ check "rename body" "$(req_field 5)" '{"name":"new name.bin"}'
 
 run mv file00000001 dir000000001
 check "mv exit code" "$RC" 0
-check "mv uses PUT" "$(req_field 1)" "PUT"
+check "mv uses PATCH" "$(req_field 1)" "PATCH"
 check "mv body" "$(req_field 5)" '{"parentId":"dir000000001"}'
 
 run note file00000001 "a note"
 check "note exit code" "$RC" 0
+check "note uses PATCH" "$(req_field 1)" "PATCH"
 check "note body" "$(req_field 5)" '{"note":"a note"}'
 
 before="$(req_count)"
@@ -253,8 +254,8 @@ run get-dir dir000000001 --json;     check "get-dir" "$(req_field 2)" "/api/fs/d
 run create-dir newdir dir000000001;  check "create-dir" "$(req_field 5)" '{"name":"newdir"}'
 run create-dir newdir;               check "create-dir still requires a parent" "$RC" 2
 run rename-dir d1 n1;                check "rename-dir" "$(req_field 1)" "PATCH"
-run move-file f1 d1;                 check "move-file" "$(req_field 5)" '{"parentId":"d1"}'
-run add-note-file f1 "n";            check "add-note-file" "$(req_field 5)" '{"note":"n"}'
+run move-file f1 d1;                 check "move-file exit code" "$RC" 0; check "move-file" "$(req_field 5)" '{"parentId":"d1"}'
+run add-note-file f1 "n";            check "add-note-file exit code" "$RC" 0; check "add-note-file" "$(req_field 5)" '{"note":"n"}'
 run delete-dir d1;                   check "delete-dir" "$(req_field 1)" "DELETE"
 run bulk-delete d1 d2;               check "bulk-delete" "$(req_field 2)" "/api/fs/d2"
 unset BUZZHEAVIER_ACCOUNT_ID
@@ -306,6 +307,8 @@ if (( have_jq )); then
   contains "ls has a header" "$OUT" "NAME"
   contains "ls marks directories" "$OUT" "Movies/"
   contains "ls shows sizes" "$OUT" "1.5 KB"
+  contains "ls shows downloads and date" "$OUT" "7   2025-12-31"
+  contains "ls header has the new columns" "$OUT" "CREATED"
   contains "ls shows big sizes" "$OUT" "5 GB"
   contains "ls keeps UTF-8 names" "$OUT" "alpha zażółć.txt"
   check "ls sorts directories first" "$(printf '%s\n' "$OUT" | sed -n 2p | cut -c1-3)" "dir"

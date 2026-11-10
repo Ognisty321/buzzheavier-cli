@@ -118,7 +118,7 @@ Quick tour:
 ./buzzheavier.sh mkdir "Holiday photos"
 ./buzzheavier.sh rename <id> "new name.mp4"
 ./buzzheavier.sh mv <id> <newParentId>
-./buzzheavier.sh rm <dirId>
+./buzzheavier.sh rm <id>
 ```
 
 ---
@@ -151,9 +151,21 @@ All of these need the account ID.
 | `rename <id> <newName>`   | Rename a file or directory                                         |
 | `mv <id> <newParentId>`   | Move a file or directory                                           |
 | `note <fileId> <text>`    | Set or replace the note of a file                                  |
-| `rm <dirId>...`           | Delete directories **including everything inside them**            |
+| `rm <id>...`              | Delete files or directories; a directory is deleted **with everything inside it** |
 
 `rm` asks for confirmation when run in a terminal. Pass `-y` to skip the question. When input is not a terminal (scripts, pipes) it does not ask.
+
+With `jq` installed, `ls` prints a table:
+
+```console
+$ ./buzzheavier.sh ls
+Directory: root  [id: r00t1d2x3y4z]
+TYPE  ID            SIZE      DL  CREATED     NAME
+dir   d1r2e3x4a5m6  -         -   2026-11-10  Backups/
+file  f1l2e3x4a5m6  112.3 KB  4   2025-12-31  notes.txt
+```
+
+> The official API reference lists `PUT` for moving items and setting notes, but the server only accepts `PATCH` for them (`PUT` answers `405 Method Not Allowed`). This CLI uses `PATCH`.
 
 ### Account and setup
 
@@ -256,13 +268,14 @@ The command names of version 1 keep working, with the same arguments:
 | `rename-dir`, `rename-file <id> <newName> [account_id]`     | `rename <id> <newName>`      |
 | `move`, `move-dir`, `move-file <id> <newParentId> [account_id]` | `mv <id> <newParentId>`  |
 | `add-note-file <fileId> <noteString> [account_id]`          | `note <fileId> <text>`       |
-| `delete-dir <directoryId> [account_id]`                     | `rm <dirId>`                 |
-| `bulk-delete <dirId1> [dirId2] ...`                         | `rm <dirId>...`              |
+| `delete-dir <directoryId> [account_id]`                     | `rm <id>`                    |
+| `bulk-delete <dirId1> [dirId2] ...`                         | `rm <id>...`                 |
 
 Differences from version 1 that scripts may notice:
 
 - Status messages (`Uploading ...`) now go to stderr, and uploads print only the download link on stdout. Use `--json` to get the API response as before.
 - Failed requests now return a non-zero exit code.
+- Moving items and setting notes (`move-*`, `add-note-file`) now work; version 1 sent `PUT`, which the server rejects.
 - `delete-dir` and `bulk-delete` ask for confirmation when run in a terminal (`-y` skips it).
 
 ---
