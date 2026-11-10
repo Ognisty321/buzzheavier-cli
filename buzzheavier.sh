@@ -1,61 +1,153 @@
 #!/usr/bin/env bash
 #
-# Buzzheavier CLI (improved)
-#   A Bash CLI for interacting with buzzheavier.com programmatically.
+# buzzheavier-cli - a Bash command-line client for buzzheavier.com
+#   https://github.com/Ognisty321/buzzheavier-cli
 #
 # Dependencies:
-#   - bash 4+
-#   - curl
-#   - jq (optional)
-#   - base64 or openssl (for upload-note)
+#   - bash, curl
+#   - jq (optional: formatted tables; without it raw JSON is printed)
+#   - base64 or openssl (only for upload notes)
+#
+# Output contract:
+#   - results (download links, tables, JSON) go to stdout
+#   - progress, status and error messages go to stderr
+#   - exit code: 0 success, 1 failure (network / API error), 2 usage error
 #
 
+VERSION="2.0.0"
+PROG="${0##*/}"
+
+set -o pipefail
+
 ########################################
-# Configuration & Global Variables
+# Configuration & global state
 ########################################
 API_BASE="${BUZZHEAVIER_API_BASE:-https://buzzheavier.com/api}"
 UPLOAD_BASE="${BUZZHEAVIER_UPLOAD_BASE:-https://w.buzzheavier.com}"
 DOWNLOAD_BASE="${BUZZHEAVIER_DOWNLOAD_BASE:-https://buzzheavier.com}"
+API_BASE="${API_BASE%/}"
+UPLOAD_BASE="${UPLOAD_BASE%/}"
+DOWNLOAD_BASE="${DOWNLOAD_BASE%/}"
 
-CONFIG_FILE="${HOME}/.config/buzzheavier-cli/config"
+CONNECT_TIMEOUT=20   # seconds, every request
+API_TIMEOUT=60       # seconds, API calls only (uploads have no time limit)
+MAX_NAME_LEN=500
+MAX_NOTE_LEN=500
 
-ACCOUNT_ID=""     # Loaded from config (or env)
-HTTP_STATUS=""    # Set by curl wrappers
+LEGACY_CONFIG_FILE="${HOME}/.config/buzzheavier-cli/config"
+CONFIG_FILE="${XDG_CONFIG_HOME:-${HOME}/.config}/buzzheavier-cli/config"
+# Keep using a pre-existing config from the old default location.
+if [[ ! -f "$CONFIG_FILE" && -f "$LEGACY_CONFIG_FILE" ]]; then
+  CONFIG_FILE="$LEGACY_CONFIG_FILE"
+fi
+
+ACCOUNT_ID=""        # from env or config file (see load_token)
+TOKEN_SOURCE="none"  # env | config | none
+TOKEN=""             # token used by the current command (see resolve_token)
+HTTP_STATUS=""       # set by http_request
+RESP_BODY=""         # set by http_request
+
+OPT_JSON=0
+OPT_QUIET=0
+OPT_YES=0
+OPT_NO_COLOR=0
+JQ_HINT_SHOWN=0
 
 ########################################
-# Helpers
+# UI helpers
 ########################################
 have() { command -v "$1" >/dev/null 2>&1; }
 
-log() { printf '%s\n' "$*"; }
-warn() { printf 'Warning: %s\n' "$*" >&2; }
-err() { printf 'Error: %s\n' "$*" >&2; }
+# C_* colour stderr messages, O_* colour stdout output. Empty when not a TTY.
+C_RST="" C_RED="" C_GREEN="" C_YELLOW="" C_CYAN="" C_DIM="" C_BOLD=""
+O_RST="" O_BOLD="" O_BLUE="" O_DIM="" O_CYAN=""
+SYM_OK="OK" SYM_ARROW="->" SYM_DOTS="..."
+
+setup_ui() {
+  local color=1
+  if (( OPT_NO_COLOR )) || [[ -n "${NO_COLOR:-}" || "${TERM:-}" == "dumb" ]]; then
+    color=0
+  fi
+  if (( color )) && [[ -t 2 ]]; then
+    C_RST=$'\033[0m' C_RED=$'\033[1;31m' C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m' C_CYAN=$'\033[36m' C_DIM=$'\033[2m' C_BOLD=$'\033[1m'
+  fi
+  if (( color )) && [[ -t 1 ]]; then
+    O_RST=$'\033[0m' O_BOLD=$'\033[1m' O_BLUE=$'\033[1;34m'
+    O_DIM=$'\033[2m' O_CYAN=$'\033[36m'
+  fi
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*)
+      SYM_OK="✔" SYM_ARROW="→" SYM_DOTS="…"
+      ;;
+  esac
+}
+
+step() { (( OPT_QUIET )) || printf '%s %s\n' "${C_CYAN}${SYM_ARROW}${C_RST}" "$*" >&2; }
+ok()   { (( OPT_QUIET )) || printf '%s %s\n' "${C_GREEN}${SYM_OK}${C_RST}" "$*" >&2; }
+hint() { (( OPT_QUIET )) || printf '%s\n' "${C_DIM}$*${C_RST}" >&2; }
+warn() { printf '%s %s\n' "${C_YELLOW}warning:${C_RST}" "$*" >&2; }
+err()  { printf '%s %s\n' "${C_RED}error:${C_RST}" "$*" >&2; }
 
 die() { err "$*"; exit 1; }
 
-# Best-effort JSON pretty printer
-pretty_json() {
-  local body="$1"
-  if have jq; then
-    # jq will error on non-JSON; fall back to raw
-    printf '%s\n' "$body" | jq . 2>/dev/null || printf '%s\n' "$body"
+# die_usage <synopsis>   e.g. die_usage "rename <id> <newName>"
+die_usage() {
+  err "Wrong arguments."
+  printf 'Usage: %s %s\n' "$PROG" "$1" >&2
+  printf "Run '%s help' for the full command list.\n" "$PROG" >&2
+  exit 2
+}
+
+# Ask before destructive actions. Skipped with -y and when stdin is not a
+# terminal (so existing scripts keep working unattended).
+confirm() {
+  (( OPT_YES )) && return 0
+  [[ -t 0 ]] || return 0
+  local reply
+  printf '%s [y/N] ' "$1" >&2
+  read -r reply || return 1
+  [[ "$reply" == [yY] || "$reply" == [yY][eE][sS] ]]
+}
+
+human_size() {
+  local b="${1:-0}" rem=0 i=0
+  local -a units=(B KB MB GB TB)
+  while (( b >= 1024 && i < 4 )); do
+    rem=$(( b % 1024 ))
+    b=$(( b / 1024 ))
+    i=$(( i + 1 ))
+  done
+  if (( i == 0 )); then
+    printf '%d B' "$b"
   else
-    printf '%s\n' "$body"
+    printf '%d.%d %s' "$b" $(( rem * 10 / 1024 )) "${units[i]}"
   fi
 }
 
-# Extract `.data.id` from typical upload responses (fallback if jq missing)
-extract_upload_id() {
-  local body="$1"
-  if have jq; then
-    printf '%s\n' "$body" | jq -r '.data.id // empty' 2>/dev/null
-    return 0
-  fi
-  # Fallback: naive regex for "id":"..."; take the first match
-  printf '%s\n' "$body" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -n 1
+########################################
+# Encoding helpers
+########################################
+
+# Percent-encode every byte outside the RFC 3986 "unreserved" set.
+# Pure Bash, so it behaves the same everywhere (UTF-8 names included).
+urlencode() {
+  local LC_ALL=C
+  local s="$1" out="" c hex i
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *)
+        printf -v hex '%02X' "'$c"
+        out+="%${hex: -2}"
+        ;;
+    esac
+  done
+  printf '%s' "$out"
 }
 
-# Minimal JSON string escaping (enough for names/notes)
+# JSON string escaping (enough for names and notes)
 json_escape() {
   local s="$1"
   s=${s//\\/\\\\}
@@ -63,752 +155,898 @@ json_escape() {
   s=${s//$'\n'/\\n}
   s=${s//$'\r'/\\r}
   s=${s//$'\t'/\\t}
+  s=${s//$'\b'/\\b}
+  s=${s//$'\f'/\\f}
   printf '%s' "$s"
 }
 
-# URL-encode a string (used for query params like note=...)
-urlencode() {
-  local s="$1"
-  if have python3; then
-    python3 - "$s" <<'PY'
-import sys, urllib.parse
-print(urllib.parse.quote(sys.argv[1], safe=""))
-PY
-    return 0
+base64_encode() {
+  if have base64; then
+    # Some implementations wrap long output; strip the line breaks.
+    printf '%s' "$1" | base64 | tr -d '\r\n'
+  elif have openssl; then
+    printf '%s' "$1" | openssl base64 -A
+  else
+    return 1
   fi
-  if have jq; then
-    printf '%s' "$s" | jq -sRr @uri
-    return 0
-  fi
-  if have perl; then
-    perl -MURI::Escape -e 'print uri_escape($ARGV[0]);' "$s"
-    return 0
-  fi
-
-  # Fallback: enough for base64 strings and common ASCII
-  local out="$s"
-  out=${out//%/%25}
-  out=${out// /%20}
-  out=${out//+/%2B}
-  out=${out//\//%2F}
-  out=${out//=/%3D}
-  out=${out//$'\n'/%0A}
-  out=${out//$'\r'/%0D}
-  printf '%s' "$out"
 }
 
 ########################################
-# Usage
+# Output helpers
 ########################################
-usage() {
-  cat <<EOF
-Usage: $(basename "$0") <command> [arguments...]
+print_json() {
+  local body="${1-$RESP_BODY}"
+  [[ -n "$body" ]] || return 0
+  if have jq; then
+    printf '%s\n' "$body" | jq . 2>/dev/null || printf '%s\n' "$body"
+  else
+    printf '%s\n' "$body"
+  fi
+}
 
-Config:
-  set-token <account_id>
-  unset-token
-  config              Show config status (does not print the full token)
+jq_hint() {
+  (( JQ_HINT_SHOWN )) && return 0
+  JQ_HINT_SHOWN=1
+  hint "Tip: install 'jq' to get formatted tables instead of raw JSON."
+}
 
-Interactive:
-  interactive
+# `.data.id` of the last response (falls back to the first "id" without jq)
+extract_id() {
+  if have jq; then
+    printf '%s\n' "$RESP_BODY" | jq -r '.data.id // empty' 2>/dev/null
+    return 0
+  fi
+  printf '%s\n' "$RESP_BODY" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
 
-Uploads:
-  upload-anon <filePath> <fileName>
-  upload-auth <filePath> <parentId> <fileName> [account_id]
-  upload-loc  <filePath> <fileName> <locationId>
-  upload-note <filePath> <fileName> <noteString>
-  bulk-upload <parentId> <file1> [file2] ...
+# Error text of the last response, if the API sent one
+api_error_message() {
+  local msg=""
+  if have jq; then
+    msg=$(printf '%s\n' "$RESP_BODY" | jq -r '(.error // .message // empty) | tostring' 2>/dev/null)
+  fi
+  if [[ -z "$msg" ]]; then
+    msg=$(printf '%s\n' "$RESP_BODY" \
+      | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+  fi
+  printf '%s' "$msg"
+}
 
-Public / Account:
-  locations
-  account [account_id]
-
-File Manager:
-  get-root [account_id]
-  get-dir <directoryId> [account_id]
-  create-dir <name> <parentId> [account_id]
-  rename-dir <directoryId> <newName> [account_id]
-  move-dir <directoryId> <newParentId> [account_id]
-  rename-file <fileId> <newName> [account_id]
-  move-file <fileId> <newParentId> [account_id]
-  add-note-file <fileId> <noteString> [account_id]
-  delete-dir <directoryId> [account_id]
-  bulk-delete <dirId1> [dirId2] ...
-
-Convenience aliases (same underlying API endpoints):
-  ls [directoryId] [account_id]        Alias for get-root/get-dir
-  rename <id> <newName> [account_id]   Alias for rename-dir/rename-file
-  move   <id> <newParentId> [account_id] Alias for move-dir/move-file
-  help | -h | --help
-
-Environment overrides:
-  BUZZHEAVIER_ACCOUNT_ID   (takes precedence over config file)
-  BUZZHEAVIER_API_BASE     (default: https://buzzheavier.com/api)
-  BUZZHEAVIER_UPLOAD_BASE  (default: https://w.buzzheavier.com)
-  BUZZHEAVIER_DOWNLOAD_BASE (default: https://buzzheavier.com)
-
-EOF
+# print_table <header>   TSV rows on stdin, TSV header as argument ("" = none).
+# The last column is left unpadded so wide (non-ASCII) names cannot break it.
+print_table() {
+  local header="$1" line cell out i last n=0
+  local -a rows=() w=() f=()
+  [[ -n "$header" ]] && rows+=("$header")
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && rows+=("$line")
+  done
+  for line in "${rows[@]}"; do
+    IFS=$'\t' read -ra f <<<"$line"
+    for (( i = 0; i < ${#f[@]}; i++ )); do
+      (( ${#f[i]} > ${w[i]:-0} )) && w[i]=${#f[i]}
+    done
+  done
+  for line in "${rows[@]}"; do
+    IFS=$'\t' read -ra f <<<"$line"
+    out=""
+    last=$(( ${#f[@]} - 1 ))
+    for (( i = 0; i <= last; i++ )); do
+      if (( i == last )); then
+        out+="${f[i]}"
+      else
+        printf -v cell '%-*s' "${w[i]}" "${f[i]}"
+        out+="${cell}  "
+      fi
+    done
+    if [[ -n "$header" ]] && (( n == 0 )); then
+      printf '%s%s%s\n' "$O_BOLD" "$out" "$O_RST"
+    elif [[ "${f[0]}" == "dir" ]]; then
+      printf '%s%s%s\n' "$O_BLUE" "$out" "$O_RST"
+    else
+      printf '%s\n' "$out"
+    fi
+    n=$(( n + 1 ))
+  done
 }
 
 ########################################
 # Token handling
 ########################################
-load_token_from_config() {
-  # Env var wins
+valid_token() { [[ "$1" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; }
+
+load_token() {
+  ACCOUNT_ID=""
+  TOKEN_SOURCE="none"
   if [[ -n "${BUZZHEAVIER_ACCOUNT_ID:-}" ]]; then
-    ACCOUNT_ID="${BUZZHEAVIER_ACCOUNT_ID}"
+    ACCOUNT_ID="$BUZZHEAVIER_ACCOUNT_ID"
+    TOKEN_SOURCE="env"
     return 0
   fi
-
   [[ -f "$CONFIG_FILE" ]] || return 0
 
-  # Parse ACCOUNT_ID=... without sourcing (avoid executing arbitrary code)
+  # Parse ACCOUNT_ID=... by hand; never `source` the file.
   local line
-  line=$(grep -E '^[[:space:]]*ACCOUNT_ID=' "$CONFIG_FILE" 2>/dev/null | head -n 1 || true)
-  [[ -n "$line" ]] || return 0
-
-  line=${line#ACCOUNT_ID=}
-  # Trim surrounding quotes if present
-  line=${line#\"}; line=${line%\"}
-  line=${line#\'}; line=${line%\'}
-  ACCOUNT_ID="$line"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ "$line" == ACCOUNT_ID=* ]] || continue
+    line="${line#ACCOUNT_ID=}"
+    line="${line%"${line##*[![:space:]]}"}"
+    line="${line#\"}"; line="${line%\"}"
+    line="${line#\'}"; line="${line%\'}"
+    if [[ -n "$line" ]]; then
+      ACCOUNT_ID="$line"
+      TOKEN_SOURCE="config"
+    fi
+    break
+  done < "$CONFIG_FILE"
 }
 
-set_token() {
-  local newToken="${1:-}"
-  [[ -n "$newToken" ]] || die "You must provide an account id. Example: $(basename "$0") set-token YOUR_ACCOUNT_ID"
+# resolve_token [explicit]   Sets TOKEN (explicit > env > config) or exits.
+# Must not be called inside $(...), or the exit would be swallowed.
+resolve_token() {
+  TOKEN="${1:-$ACCOUNT_ID}"
+  if [[ -z "$TOKEN" ]]; then
+    err "This command needs your account ID, and none is configured."
+    printf 'Save it once with:  %s set-token\n' "$PROG" >&2
+    printf 'or set the BUZZHEAVIER_ACCOUNT_ID environment variable.\n' >&2
+    exit 1
+  fi
+  valid_token "$TOKEN" || die "The account ID contains unexpected characters (spaces, quotes ...)."
+}
 
-  mkdir -p "$(dirname "$CONFIG_FILE")"
-  # Write as plain text for safe parsing
-  printf 'ACCOUNT_ID=%s\n' "$newToken" > "$CONFIG_FILE"
+cmd_set_token() {
+  local tok="${1:-}"
+  if [[ -z "$tok" ]]; then
+    # No argument: read it without echoing, keeping it out of shell history.
+    if [[ -t 0 ]]; then
+      read -rsp "Account ID (input hidden): " tok || true
+      printf '\n' >&2
+    else
+      IFS= read -r tok || true
+    fi
+  fi
+  tok="${tok%$'\r'}"
+  [[ -n "$tok" ]] || die "No account ID given."
+  valid_token "$tok" || die "That does not look like an account ID (unexpected characters)."
+
+  local dir="${CONFIG_FILE%/*}"
+  ( umask 077 && mkdir -p "$dir" && printf 'ACCOUNT_ID=%s\n' "$tok" > "$CONFIG_FILE" ) \
+    || die "Could not write $CONFIG_FILE"
   chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-  log "Account ID saved to $CONFIG_FILE"
-}
-
-unset_token() {
-  if [[ -f "$CONFIG_FILE" ]]; then
-    rm -f "$CONFIG_FILE"
-    log "Removed $CONFIG_FILE"
-  else
-    log "No config file found at $CONFIG_FILE"
-  fi
-}
-
-get_token_argument_or_config() {
-  local passed="${1:-}"
-  if [[ -n "$passed" ]]; then
-    printf '%s' "$passed"
-    return 0
-  fi
-  if [[ -z "$ACCOUNT_ID" ]]; then
-    die "No account id provided and none found in $CONFIG_FILE. Run: $(basename "$0") set-token YOUR_ACCOUNT_ID"
-  fi
-  printf '%s' "$ACCOUNT_ID"
-}
-
-show_config() {
-  log "Config file: $CONFIG_FILE"
+  ok "Account ID saved to $CONFIG_FILE"
   if [[ -n "${BUZZHEAVIER_ACCOUNT_ID:-}" ]]; then
-    log "Token source: BUZZHEAVIER_ACCOUNT_ID env var"
-    log "Account ID: (hidden) length=${#BUZZHEAVIER_ACCOUNT_ID}"
-    return 0
+    warn "BUZZHEAVIER_ACCOUNT_ID is set and takes precedence over the saved value."
   fi
+  hint "Check it with: $PROG account"
+}
 
-  if [[ -z "$ACCOUNT_ID" ]]; then
-    log "Account ID: not set"
-    return 0
+cmd_unset_token() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    rm -f "$CONFIG_FILE" || die "Could not remove $CONFIG_FILE"
+    ok "Removed $CONFIG_FILE"
+  else
+    hint "Nothing to remove (no config file at $CONFIG_FILE)."
   fi
+}
 
-  # Mask token display
-  local tail="${ACCOUNT_ID: -4}"
-  local head="${ACCOUNT_ID:0:2}"
-  log "Token source: config file"
-  log "Account ID: ${head}…${tail} (length=${#ACCOUNT_ID})"
+mask_token() {
+  local t="$1"
+  if (( ${#t} <= 8 )); then
+    printf '****'
+  else
+    printf '%s%s%s' "${t:0:2}" "$SYM_DOTS" "${t: -4}"
+  fi
+}
+
+cmd_config() {
+  local src="not set" tok="-" jq_state="not installed (raw JSON output)"
+  case "$TOKEN_SOURCE" in
+    env)    src="BUZZHEAVIER_ACCOUNT_ID environment variable" ;;
+    config) src="config file" ;;
+  esac
+  [[ -n "$ACCOUNT_ID" ]] && tok="$(mask_token "$ACCOUNT_ID") (${#ACCOUNT_ID} characters)"
+  have jq && jq_state="installed"
+  printf '%-14s %s\n' \
+    "Version:"     "$VERSION" \
+    "Config file:" "$CONFIG_FILE" \
+    "Account ID:"  "$tok" \
+    "Source:"      "$src" \
+    "API:"         "$API_BASE" \
+    "Upload:"      "$UPLOAD_BASE" \
+    "Download:"    "$DOWNLOAD_BASE" \
+    "jq:"          "$jq_state"
 }
 
 ########################################
-# curl wrappers (capture body + HTTP status)
+# HTTP layer
 ########################################
-curl_capture() {
-  # Usage: curl_capture <curl args...>
-  # Sets global HTTP_STATUS, prints body to stdout.
+status_ok() { [[ "$1" =~ ^2[0-9][0-9]$ ]]; }
+
+# http_request <token|""> <curl args...>
+# Sets HTTP_STATUS and RESP_BODY; returns curl's exit code.
+# Call it directly (not in $(...)), otherwise the globals are lost.
+# The token is handed to curl on stdin, so it never shows up in `ps` output.
+http_request() {
+  local token="$1"; shift
   local out rc
-  out=$(curl "$@" -w $'\n%{http_code}')
-  rc=$?
-  if [[ $rc -ne 0 ]]; then
-    HTTP_STATUS=""
-    return $rc
+  local -a base=(--globoff --connect-timeout "$CONNECT_TIMEOUT" -A "buzzheavier-cli/${VERSION}")
+
+  HTTP_STATUS=""
+  RESP_BODY=""
+  if [[ -n "$token" ]]; then
+    out=$(curl "${base[@]}" "$@" -w $'\n%{http_code}' --config - \
+      <<<"header = \"Authorization: Bearer ${token}\"")
+    rc=$?
+  else
+    out=$(curl "${base[@]}" "$@" -w $'\n%{http_code}')
+    rc=$?
   fi
+  (( rc == 0 )) || return "$rc"
   HTTP_STATUS="${out##*$'\n'}"
-  printf '%s' "${out%$'\n'*}"
+  RESP_BODY="${out%$'\n'*}"
   return 0
 }
 
-api_call() {
-  # Usage: api_call <METHOD> <URL> [curl args...]
-  local method="$1"; shift
-  local url="$1"; shift
-  curl_capture -sS -X "$method" "$@" "$url"
+# Turn a non-2xx answer into an error message + non-zero return.
+require_ok() {
+  status_ok "$HTTP_STATUS" && return 0
+  local msg
+  msg="$(api_error_message)"
+  (( OPT_JSON )) && print_json
+  err "${1:-Request failed}: HTTP ${HTTP_STATUS}${msg:+ - $msg}"
+  case "$HTTP_STATUS" in
+    401 | 403) hint "Is your account ID correct? Check with: $PROG config" ;;
+  esac
+  return 1
 }
 
-upload_call() {
-  # Usage: upload_call <filePath> <URL> [curl args...]
-  local filePath="$1"; shift
-  local url="$1"; shift
-  curl_capture --progress-bar -sS -T "$filePath" "$@" "$url"
-}
-
-status_ok() {
-  [[ "$1" =~ ^2[0-9][0-9]$ ]]
+# api <METHOD> <path> <token|""> [json-payload]
+api() {
+  local method="$1" path="$2" token="$3"
+  local -a args=(-sS --max-time "$API_TIMEOUT" -X "$method" -H "Accept: application/json")
+  if (( $# >= 4 )); then
+    args+=(-H "Content-Type: application/json" --data-binary "$4")
+  fi
+  if ! http_request "$token" "${args[@]}" "${API_BASE}${path}"; then
+    err "Could not reach ${API_BASE} (see the curl message above)."
+    return 1
+  fi
+  require_ok
 }
 
 ########################################
 # Uploads
 ########################################
-upload_anon() {
-  local filePath="${1:-}"
-  local fileName="${2:-}"
-  [[ -n "$filePath" && -n "$fileName" ]] || die "Usage: upload-anon <filePath> <fileName>"
-  [[ -f "$filePath" ]] || die "File does not exist: $filePath"
-  (( ${#fileName} <= 500 )) || die "fileName is too long (${#fileName} > 500)"
 
-  log "Uploading (anon): $filePath -> $fileName"
-  local body
-  if ! body=$(upload_call "$filePath" "${UPLOAD_BASE}/${fileName}"); then
-    die "Upload failed (curl error)."
+# do_upload <file> <name|""> <parentId|""> <locationId|""> <note|""> <token|"">
+# Prints the download link (or raw JSON with --json) on stdout.
+do_upload() {
+  local file="$1" name="$2" parent="$3" loc="$4" note="$5" token="$6"
+
+  [[ -e "$file" ]] || { err "No such file: $file"; return 1; }
+  [[ -f "$file" ]] || { err "Not a regular file: $file"; return 1; }
+  [[ -r "$file" ]] || { err "File is not readable: $file"; return 1; }
+  [[ -n "$name" ]] || name="${file##*/}"
+  [[ "$name" != */* ]] || { err "File name must not contain '/': $name"; return 1; }
+  (( ${#name} <= MAX_NAME_LEN )) \
+    || { err "File name is too long (${#name} > ${MAX_NAME_LEN} characters): $name"; return 1; }
+
+  local url="${UPLOAD_BASE}/" query=""
+  [[ -n "$parent" ]] && url+="$(urlencode "$parent")/"
+  url+="$(urlencode "$name")"
+  [[ -n "$loc" ]] && query+="&locationId=$(urlencode "$loc")"
+  if [[ -n "$note" ]]; then
+    (( ${#note} <= MAX_NOTE_LEN )) \
+      || { err "Note is too long (${#note} > ${MAX_NOTE_LEN} characters)."; return 1; }
+    local encoded
+    encoded="$(base64_encode "$note")" \
+      || { err "Neither 'base64' nor 'openssl' found; cannot encode the note."; return 1; }
+    query+="&note=$(urlencode "$encoded")"
   fi
+  [[ -n "$query" ]] && url+="?${query:1}"
 
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
+  local src="$file"
+  # Git Bash / Cygwin: hand curl a Windows-style path. The automatic path
+  # conversion of MSYS gives up on names containing characters like {} or #.
+  case "${OSTYPE:-}" in
+    msys* | cygwin*)
+      if have cygpath; then
+        src="$(cygpath -m -- "$file" 2>/dev/null)" || src="$file"
+        [[ -n "$src" ]] || src="$file"
+      fi
+      ;;
+  esac
+  # curl treats "-T -" and "-T ." as stdin; make bare names unambiguous.
+  [[ "$src" == */* ]] || src="./$src"
 
-  local id
-  id=$(extract_upload_id "$body")
-  if [[ -n "$id" ]]; then
-    log "Download link: ${DOWNLOAD_BASE}/${id}"
-  fi
-}
+  local size
+  size="$(wc -c < "$file" 2>/dev/null | tr -d '[:space:]')"
+  step "Uploading ${name} ($(human_size "${size:-0}"))${parent:+ to directory ${parent}}"
 
-upload_auth() {
-  local filePath="${1:-}"
-  local parentId="${2:-}"
-  local fileName="${3:-}"
-  local tokenArg="${4:-}"
-  [[ -n "$filePath" && -n "$parentId" && -n "$fileName" ]] || die "Usage: upload-auth <filePath> <parentId> <fileName> [account_id]"
-  [[ -f "$filePath" ]] || die "File does not exist: $filePath"
-  (( ${#fileName} <= 500 )) || die "fileName is too long (${#fileName} > 500)"
-
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  log "Uploading (auth): $filePath -> ${parentId}/${fileName}"
-  local body
-  if ! body=$(upload_call "$filePath" "${UPLOAD_BASE}/${parentId}/${fileName}" -H "Authorization: Bearer $token"); then
-    die "Upload failed (curl error)."
-  fi
-
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-
-  local id
-  id=$(extract_upload_id "$body")
-  if [[ -n "$id" ]]; then
-    log "Download link: ${DOWNLOAD_BASE}/${id}"
-  fi
-}
-
-upload_loc() {
-  local filePath="${1:-}"
-  local fileName="${2:-}"
-  local locationId="${3:-}"
-  [[ -n "$filePath" && -n "$fileName" && -n "$locationId" ]] || die "Usage: upload-loc <filePath> <fileName> <locationId>"
-  [[ -f "$filePath" ]] || die "File does not exist: $filePath"
-  (( ${#fileName} <= 500 )) || die "fileName is too long (${#fileName} > 500)"
-
-  log "Uploading (location=${locationId}): $filePath -> $fileName"
-  local body
-  if ! body=$(upload_call "$filePath" "${UPLOAD_BASE}/${fileName}?locationId=$(urlencode "$locationId")"); then
-    die "Upload failed (curl error)."
-  fi
-
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-
-  local id
-  id=$(extract_upload_id "$body")
-  if [[ -n "$id" ]]; then
-    log "Download link: ${DOWNLOAD_BASE}/${id}"
-  fi
-}
-
-upload_note() {
-  local filePath="${1:-}"
-  local fileName="${2:-}"
-  local noteString="${3:-}"
-  [[ -n "$filePath" && -n "$fileName" && -n "$noteString" ]] || die "Usage: upload-note <filePath> <fileName> <noteString>"
-  [[ -f "$filePath" ]] || die "File does not exist: $filePath"
-  (( ${#fileName} <= 500 )) || die "fileName is too long (${#fileName} > 500)"
-  (( ${#noteString} <= 500 )) || die "noteString is too long (${#noteString} > 500)"
-
-  local encodedNote
-  if have base64; then
-    # Cross-platform: remove newlines because some base64 implementations wrap output
-    encodedNote=$(printf '%s' "$noteString" | base64 | tr -d '\n')
-  elif have openssl; then
-    encodedNote=$(printf '%s' "$noteString" | openssl base64 -A)
+  local -a args=(-T "$src")
+  if (( OPT_QUIET )) || [[ ! -t 2 ]]; then
+    args+=(-sS)
   else
-    die "Neither base64 nor openssl found; cannot encode note."
+    args+=(-#)   # progress bar on stderr
   fi
 
-  # Important: base64 commonly includes +/= which should be URL-encoded in query strings
-  local encodedNoteUrl
-  encodedNoteUrl=$(urlencode "$encodedNote")
-
-  log "Uploading (with note): $filePath -> $fileName"
-  local body
-  if ! body=$(upload_call "$filePath" "${UPLOAD_BASE}/${fileName}?note=${encodedNoteUrl}"); then
-    die "Upload failed (curl error)."
+  if ! http_request "$token" "${args[@]}" "$url"; then
+    err "Upload failed: ${name} (see the curl message above)."
+    return 1
+  fi
+  if ! require_ok "Upload failed: ${name}"; then
+    # The server refuses some characters in names (for example '#').
+    if [[ "$HTTP_STATUS" == 400 ]]; then
+      hint "If the server does not accept this file name, pick another one with: -n <name>"
+    fi
+    return 1
   fi
 
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-
+  if (( OPT_JSON )); then
+    print_json
+    return 0
+  fi
   local id
-  id=$(extract_upload_id "$body")
+  id="$(extract_id)"
   if [[ -n "$id" ]]; then
-    log "Download link: ${DOWNLOAD_BASE}/${id}"
-  fi
-}
-
-bulk_upload() {
-  local parentId="${1:-}"
-  shift || true
-  [[ -n "$parentId" ]] || die "Usage: bulk-upload <parentId> <file1> [file2] ..."
-  [[ $# -ge 1 ]] || die "Usage: bulk-upload <parentId> <file1> [file2] ..."
-
-  local token
-  token="$(get_token_argument_or_config "")"
-
-  for filePath in "$@"; do
-    if [[ ! -f "$filePath" ]]; then
-      warn "Skipping (not a file): $filePath"
-      continue
-    fi
-    local fileName
-    fileName="$(basename "$filePath")"
-    (( ${#fileName} <= 500 )) || { warn "Skipping (fileName too long): $fileName"; continue; }
-
-    log "Bulk uploading: $fileName -> ${parentId}/${fileName}"
-    local body
-    if ! body=$(upload_call "$filePath" "${UPLOAD_BASE}/${parentId}/${fileName}" -H "Authorization: Bearer $token"); then
-      warn "Upload failed (curl error) for: $fileName"
-      continue
-    fi
-
-    log "HTTP: $HTTP_STATUS"
-    pretty_json "$body"
-
-    local id
-    id=$(extract_upload_id "$body")
-    if [[ -n "$id" ]]; then
-      log "Download link: ${DOWNLOAD_BASE}/${id}"
-    fi
-    log ""
-  done
-}
-
-########################################
-# Public / Account
-########################################
-get_locations() {
-  log "Fetching storage locations..."
-  local body
-  if ! body=$(api_call GET "${API_BASE}/locations"); then
-    die "Request failed (curl error)."
-  fi
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-}
-
-get_account() {
-  local tokenArg="${1:-}"
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  log "Fetching account info..."
-  local body
-  if ! body=$(api_call GET "${API_BASE}/account" -H "Authorization: Bearer $token"); then
-    die "Request failed (curl error)."
-  fi
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-}
-
-########################################
-# File Manager
-########################################
-get_root() {
-  local tokenArg="${1:-}"
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  log "Listing root directory..."
-  local body
-  if ! body=$(api_call GET "${API_BASE}/fs" -H "Authorization: Bearer $token"); then
-    die "Request failed (curl error)."
-  fi
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-}
-
-get_directory() {
-  local directoryId="${1:-}"
-  local tokenArg="${2:-}"
-  [[ -n "$directoryId" ]] || die "Usage: get-dir <directoryId> [account_id]"
-
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  log "Listing directory: $directoryId"
-  local body
-  if ! body=$(api_call GET "${API_BASE}/fs/${directoryId}" -H "Authorization: Bearer $token"); then
-    die "Request failed (curl error)."
-  fi
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-}
-
-create_directory() {
-  local name="${1:-}"
-  local parentId="${2:-}"
-  local tokenArg="${3:-}"
-  [[ -n "$name" && -n "$parentId" ]] || die "Usage: create-dir <name> <parentId> [account_id]"
-
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  # Official docs: POST /api/fs/{parentDirectoryId} with JSON { "name": "..." }
-  local payload
-  payload="{\"name\":\"$(json_escape "$name")\"}"
-
-  log "Creating directory '$name' under parentId='$parentId'..."
-  local body
-  if ! body=$(api_call POST "${API_BASE}/fs/${parentId}" \
-      -H "Authorization: Bearer $token" \
-      -H "Content-Type: application/json" \
-      -d "$payload"); then
-    die "Request failed (curl error)."
-  fi
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-}
-
-rename_item() {
-  local id="${1:-}"
-  local newName="${2:-}"
-  local tokenArg="${3:-}"
-  [[ -n "$id" && -n "$newName" ]] || die "Usage: rename <id> <newName> [account_id]"
-
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  local payload
-  payload="{\"name\":\"$(json_escape "$newName")\"}"
-
-  log "Renaming item $id -> $newName"
-  local body
-  if ! body=$(api_call PATCH "${API_BASE}/fs/${id}" \
-      -H "Authorization: Bearer $token" \
-      -H "Content-Type: application/json" \
-      -d "$payload"); then
-    die "Request failed (curl error)."
-  fi
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-}
-
-move_item() {
-  local id="${1:-}"
-  local newParentId="${2:-}"
-  local tokenArg="${3:-}"
-  [[ -n "$id" && -n "$newParentId" ]] || die "Usage: move <id> <newParentId> [account_id]"
-
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  local payload
-  payload="{\"parentId\":\"$(json_escape "$newParentId")\"}"
-
-  log "Moving item $id -> parent $newParentId"
-  local body
-  if ! body=$(api_call PUT "${API_BASE}/fs/${id}" \
-      -H "Authorization: Bearer $token" \
-      -H "Content-Type: application/json" \
-      -d "$payload"); then
-    die "Request failed (curl error)."
-  fi
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-}
-
-add_note_file() {
-  local fileId="${1:-}"
-  local noteString="${2:-}"
-  local tokenArg="${3:-}"
-  [[ -n "$fileId" && -n "$noteString" ]] || die "Usage: add-note-file <fileId> <noteString> [account_id]"
-
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  local payload
-  payload="{\"note\":\"$(json_escape "$noteString")\"}"
-
-  log "Updating note for file $fileId..."
-  local body
-  if ! body=$(api_call PUT "${API_BASE}/fs/${fileId}" \
-      -H "Authorization: Bearer $token" \
-      -H "Content-Type: application/json" \
-      -d "$payload"); then
-    die "Request failed (curl error)."
-  fi
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-}
-
-delete_directory() {
-  local directoryId="${1:-}"
-  local tokenArg="${2:-}"
-  [[ -n "$directoryId" ]] || die "Usage: delete-dir <directoryId> [account_id]"
-
-  local token
-  token="$(get_token_argument_or_config "$tokenArg")"
-
-  log "Deleting directory: $directoryId"
-  local body
-  if ! body=$(api_call DELETE "${API_BASE}/fs/${directoryId}" -H "Authorization: Bearer $token"); then
-    die "Request failed (curl error)."
-  fi
-  log "HTTP: $HTTP_STATUS"
-  pretty_json "$body"
-}
-
-bulk_delete_directories() {
-  [[ $# -ge 1 ]] || die "Usage: bulk-delete <dirId1> [dirId2] ..."
-
-  local token
-  token="$(get_token_argument_or_config "")"
-
-  for dirId in "$@"; do
-    log "Deleting directory: $dirId"
-    local body
-    if ! body=$(api_call DELETE "${API_BASE}/fs/${dirId}" -H "Authorization: Bearer $token"); then
-      warn "Request failed (curl error) for: $dirId"
-      continue
-    fi
-    log "HTTP: $HTTP_STATUS"
-    pretty_json "$body"
-  done
-}
-
-# Convenience alias: ls [id]
-ls_cmd() {
-  local maybeId="${1:-}"
-  local tokenArg="${2:-}"
-
-  if [[ -z "$maybeId" ]]; then
-    get_root "$tokenArg"
+    ok "Uploaded ${name}"
+    printf '%s/%s\n' "$DOWNLOAD_BASE" "$id"
   else
-    get_directory "$maybeId" "$tokenArg"
+    warn "Upload finished, but the response contains no file id:"
+    print_json
   fi
 }
 
-########################################
-# Interactive Menu (kept mostly the same)
-########################################
-interactive_menu() {
-  while true; do
-    echo
-    echo "========== Buzzheavier CLI Interactive Menu =========="
-    echo " 1) Set Token"
-    echo " 2) Show Account Info"
-    echo " 3) Upload File (Anon)"
-    echo " 4) Upload File (Auth)"
-    echo " 5) Bulk Upload (Auth)"
-    echo " 6) List Root Directory"
-    echo " 7) Create Directory"
-    echo " 8) Delete Directory"
-    echo " 9) Bulk Delete Directories"
-    echo "10) Get Storage Locations"
-    echo "11) Show Config"
-    echo "12) Quit"
-    echo "======================================================"
-    read -rp "Choose an option (1-12): " choice
+# upload <file>... [-d dirId] [-n name] [-l locationId] [--note text]
+cmd_upload() {
+  local synopsis="upload <file>... [-d <dirId>] [-n <name>] [-l <locationId>] [--note <text>]"
+  local parent="" name="" loc="" note="" file
+  local -a files=()
 
-    case "$choice" in
-      1)
-        read -rsp "Enter new account id: " newTok
-        echo
-        set_token "$newTok"
-        load_token_from_config
-        ;;
-      2)
-        get_account
-        ;;
-      3)
-        read -rp "Enter file path: " anonPath
-        read -rp "Enter file name as stored: " anonName
-        upload_anon "$anonPath" "$anonName"
-        ;;
-      4)
-        read -rp "Enter file path: " authPath
-        read -rp "Enter parentId: " pId
-        read -rp "Enter file name as stored: " fName
-        upload_auth "$authPath" "$pId" "$fName"
-        ;;
-      5)
-        read -rp "Enter parentId for bulk upload: " bParent
-        echo "Enter paths for files to upload (space-separated): "
-        read -ra fileArray
-        bulk_upload "$bParent" "${fileArray[@]}"
-        ;;
-      6)
-        get_root
-        ;;
-      7)
-        read -rp "Enter new directory name: " newDirName
-        read -rp "Enter parentId: " cParent
-        create_directory "$newDirName" "$cParent"
-        ;;
-      8)
-        read -rp "Enter directoryId to delete: " dId
-        delete_directory "$dId"
-        ;;
-      9)
-        echo "Enter directoryIds to bulk-delete (space-separated): "
-        read -ra dirArray
-        bulk_delete_directories "${dirArray[@]}"
-        ;;
-      10)
-        get_locations
-        ;;
-      11)
-        show_config
-        ;;
-      12)
-        log "Exiting Interactive Mode."
-        break
-        ;;
-      *)
-        warn "Invalid choice."
-        ;;
+  while (( $# )); do
+    case "$1" in
+      -d | --dir | --parent) (( $# >= 2 )) || die_usage "$synopsis"; parent="$2"; shift 2 ;;
+      -n | --name)           (( $# >= 2 )) || die_usage "$synopsis"; name="$2";   shift 2 ;;
+      -l | --location)       (( $# >= 2 )) || die_usage "$synopsis"; loc="$2";    shift 2 ;;
+      -N | --note)           (( $# >= 2 )) || die_usage "$synopsis"; note="$2";   shift 2 ;;
+      --dir=*)      parent="${1#*=}"; shift ;;
+      --name=*)     name="${1#*=}";   shift ;;
+      --location=*) loc="${1#*=}";    shift ;;
+      --note=*)     note="${1#*=}";   shift ;;
+      --) shift; while (( $# )); do files+=("$1"); shift; done ;;
+      -?*) err "Unknown option for upload: $1"; die_usage "$synopsis" ;;
+      *) files+=("$1"); shift ;;
     esac
   done
+
+  (( ${#files[@]} >= 1 )) || die_usage "$synopsis"
+  if [[ -n "$name" ]] && (( ${#files[@]} > 1 )); then
+    die "--name can only be used when uploading a single file."
+  fi
+
+  # Only uploads into a directory are authenticated; plain uploads are anonymous.
+  TOKEN=""
+  [[ -n "$parent" ]] && resolve_token ""
+
+  local failed=0 total=${#files[@]}
+  for file in "${files[@]}"; do
+    do_upload "$file" "$name" "$parent" "$loc" "$note" "$TOKEN" || failed=$(( failed + 1 ))
+  done
+  if (( total > 1 )); then
+    if (( failed )); then
+      warn "$(( total - failed )) of ${total} files uploaded, ${failed} failed."
+    else
+      ok "All ${total} files uploaded."
+    fi
+  fi
+  (( failed == 0 ))
+}
+
+# --- legacy upload commands (kept for backwards compatibility) ---
+cmd_upload_anon() {
+  (( $# >= 1 )) || die_usage "upload-anon <filePath> [fileName]"
+  do_upload "$1" "${2:-}" "" "" "" ""
+}
+
+cmd_upload_auth() {
+  (( $# >= 2 )) || die_usage "upload-auth <filePath> <parentId> [fileName] [account_id]"
+  resolve_token "${4:-}"
+  do_upload "$1" "${3:-}" "$2" "" "" "$TOKEN"
+}
+
+cmd_upload_loc() {
+  (( $# >= 3 )) || die_usage "upload-loc <filePath> <fileName> <locationId>"
+  do_upload "$1" "$2" "" "$3" "" ""
+}
+
+cmd_upload_note() {
+  (( $# >= 3 )) || die_usage "upload-note <filePath> <fileName> <noteString>"
+  do_upload "$1" "$2" "" "" "$3" ""
+}
+
+cmd_bulk_upload() {
+  (( $# >= 2 )) || die_usage "bulk-upload <parentId> <file1> [file2] ..."
+  local parent="$1"; shift
+  cmd_upload --dir "$parent" -- "$@"
+}
+
+########################################
+# Public / account
+########################################
+cmd_locations() {
+  api GET "/locations" "" || return 1
+  if (( OPT_JSON )); then print_json; return 0; fi
+  if ! have jq; then jq_hint; print_json; return 0; fi
+
+  local rows
+  if rows=$(printf '%s\n' "$RESP_BODY" \
+      | jq -r '.data[] | [(.id // "-" | tostring), (.name // "" | tostring)] | @tsv' 2>/dev/null) \
+      && [[ -n "$rows" ]]; then
+    print_table $'ID\tNAME' <<<"$rows"
+  else
+    print_json
+  fi
+}
+
+cmd_account() {
+  resolve_token "${1:-}"
+  api GET "/account" "$TOKEN" || return 1
+  if (( OPT_JSON )); then print_json; return 0; fi
+  if ! have jq; then jq_hint; print_json; return 0; fi
+
+  local rows
+  if rows=$(printf '%s\n' "$RESP_BODY" | jq -r '
+        (.data // .)
+        | if type != "object" then error("unexpected shape") else . end
+        | to_entries[]
+        | select((.value | type) != "object" and (.value | type) != "array")
+        | ["\(.key):", (.value | tostring)] | @tsv' 2>/dev/null) \
+      && [[ -n "$rows" ]]; then
+    print_table "" <<<"$rows"
+  else
+    print_json
+  fi
+}
+
+########################################
+# File manager
+########################################
+
+# Formatted directory listing from RESP_BODY; falls back to JSON when the
+# response does not look like a listing.
+render_listing() {
+  local rows title
+  if ! rows=$(printf '%s\n' "$RESP_BODY" | jq -r '
+      def isdir: (.isDirectory // .directory // .isDir // false) == true;
+      def hs:
+        if type != "number" then "-"
+        elif . < 1024 then "\(.) B"
+        else
+          [., 0]
+          | until(.[0] < 1024 or .[1] >= 4; [.[0] / 1024, .[1] + 1])
+          | "\((.[0] * 10 | floor) / 10) \(["B", "KB", "MB", "GB", "TB"][.[1]])"
+        end;
+      (.data // .) as $d
+      | (if ($d | type) == "array" then $d else $d.children end) as $items
+      | if ($items | type) != "array" then error("unexpected shape") else $items end
+      | sort_by([(isdir | not), (.name // "" | tostring | ascii_downcase)])
+      | .[]
+      | [ (if isdir then "dir" else "file" end),
+          (.id // "-" | tostring),
+          (if isdir then "-" else (.size | hs) end),
+          ((.name // "" | tostring) + (if isdir then "/" else "" end)) ]
+      | @tsv' 2>/dev/null); then
+    print_json
+    return 0
+  fi
+
+  title=$(printf '%s\n' "$RESP_BODY" | jq -r '
+      .data | select(type == "object")
+      | "\(.name // "(unnamed)")  [id: \(.id // "?")]"' 2>/dev/null)
+  [[ -n "$title" ]] && hint "Directory: $title"
+
+  if [[ -z "$rows" ]]; then
+    hint "(empty directory)"
+    return 0
+  fi
+  print_table $'TYPE\tID\tSIZE\tNAME' <<<"$rows"
+}
+
+# ls [directoryId] [account_id]
+cmd_ls() {
+  local id="${1:-}"
+  resolve_token "${2:-}"
+  local path="/fs"
+  [[ -n "$id" ]] && path="/fs/$(urlencode "$id")"
+  api GET "$path" "$TOKEN" || return 1
+  if (( OPT_JSON )); then print_json; return 0; fi
+  if ! have jq; then jq_hint; print_json; return 0; fi
+  render_listing
+}
+
+# mkdir <name> [parentId] [account_id]    (no parentId = root directory)
+cmd_mkdir() {
+  (( $# >= 1 )) && [[ -n "$1" ]] || die_usage "mkdir <name> [parentId]"
+  local name="$1" parent="${2:-}"
+  resolve_token "${3:-}"
+
+  if [[ -z "$parent" ]]; then
+    # The API wants an explicit parent, so look up the root directory id first.
+    api GET "/fs" "$TOKEN" || return 1
+    have jq && parent="$(extract_id)"
+    if [[ -z "$parent" ]]; then
+      err "Could not determine the root directory id automatically."
+      hint "Pass it explicitly: $PROG mkdir <name> <parentId>   (see: $PROG ls)"
+      return 1
+    fi
+  fi
+
+  api POST "/fs/$(urlencode "$parent")" "$TOKEN" "{\"name\":\"$(json_escape "$name")\"}" || return 1
+  if (( OPT_JSON )); then print_json; return 0; fi
+  ok "Created directory '${name}' in ${parent}"
+  local id
+  id="$(extract_id)"
+  [[ -n "$id" ]] && printf '%s\n' "$id"
+  return 0
+}
+
+# rename <id> <newName> [account_id]
+cmd_rename() {
+  (( $# >= 2 )) && [[ -n "$1" && -n "$2" ]] || die_usage "rename <id> <newName>"
+  resolve_token "${3:-}"
+  api PATCH "/fs/$(urlencode "$1")" "$TOKEN" "{\"name\":\"$(json_escape "$2")\"}" || return 1
+  (( OPT_JSON )) && print_json
+  ok "Renamed $1 ${SYM_ARROW} $2"
+}
+
+# mv <id> <newParentId> [account_id]
+cmd_move() {
+  (( $# >= 2 )) && [[ -n "$1" && -n "$2" ]] || die_usage "mv <id> <newParentId>"
+  resolve_token "${3:-}"
+  api PUT "/fs/$(urlencode "$1")" "$TOKEN" "{\"parentId\":\"$(json_escape "$2")\"}" || return 1
+  (( OPT_JSON )) && print_json
+  ok "Moved $1 ${SYM_ARROW} directory $2"
+}
+
+# note <fileId> <text> [account_id]
+cmd_note() {
+  (( $# >= 2 )) && [[ -n "$1" ]] || die_usage "note <fileId> <text>"
+  resolve_token "${3:-}"
+  api PUT "/fs/$(urlencode "$1")" "$TOKEN" "{\"note\":\"$(json_escape "$2")\"}" || return 1
+  (( OPT_JSON )) && print_json
+  ok "Note updated for $1"
+}
+
+# delete_dirs <id>...   (uses TOKEN)
+delete_dirs() {
+  local id failed=0 question
+  if (( $# == 1 )); then
+    question="Delete directory $1 and everything inside it?"
+  else
+    question="Delete $# directories and everything inside them?"
+  fi
+  if ! confirm "$question"; then
+    hint "Aborted, nothing was deleted."
+    return 1
+  fi
+
+  for id in "$@"; do
+    if api DELETE "/fs/$(urlencode "$id")" "$TOKEN"; then
+      (( OPT_JSON )) && print_json
+      ok "Deleted $id"
+    else
+      failed=$(( failed + 1 ))
+    fi
+  done
+  (( failed == 0 ))
+}
+
+# rm <dirId>...
+cmd_rm() {
+  (( $# >= 1 )) || die_usage "rm <dirId>..."
+  resolve_token ""
+  delete_dirs "$@"
+}
+
+# delete-dir <directoryId> [account_id]   (legacy form with optional token)
+cmd_delete_dir() {
+  (( $# >= 1 )) && [[ -n "$1" ]] || die_usage "delete-dir <directoryId> [account_id]"
+  resolve_token "${2:-}"
+  delete_dirs "$1"
+}
+
+########################################
+# Interactive menu
+########################################
+ASK_REPLY=""
+
+# ask <prompt>   Reads a line into ASK_REPLY; returns 1 on EOF.
+ask() {
+  ASK_REPLY=""
+  read -rp "$1" ASK_REPLY || return 1
+  ASK_REPLY="${ASK_REPLY%$'\r'}"
+  return 0
+}
+
+# ask_path <prompt>   Like ask, but strips drag-and-drop quotes and expands ~
+ask_path() {
+  ask "$1" || return 1
+  ASK_REPLY="${ASK_REPLY#\"}"; ASK_REPLY="${ASK_REPLY%\"}"
+  ASK_REPLY="${ASK_REPLY#\'}"; ASK_REPLY="${ASK_REPLY%\'}"
+  # shellcheck disable=SC2088  # a literal ~ typed by the user, expanded by hand
+  case "$ASK_REPLY" in
+    "~") ASK_REPLY="$HOME" ;;
+    "~/"*) ASK_REPLY="${HOME}/${ASK_REPLY:2}" ;;
+  esac
+  return 0
+}
+
+interactive_menu() {
+  local choice a acct
+  local -a list=()
+
+  while true; do
+    load_token
+    acct="not set"
+    [[ -n "$ACCOUNT_ID" ]] && acct="$(mask_token "$ACCOUNT_ID")"
+    cat >&2 <<EOF
+
+${C_BOLD}Buzzheavier CLI${C_RST} ${C_DIM}v${VERSION} - account ID: ${acct}${C_RST}
+
+ ${C_CYAN}Upload${C_RST}
+   1) Upload a file (anonymous)
+   2) Upload file(s) into a directory
+ ${C_CYAN}Browse${C_RST}
+   3) List root directory
+   4) List a directory
+ ${C_CYAN}Manage${C_RST}
+   5) Create directory
+   6) Rename file or directory
+   7) Move file or directory
+   8) Set a file note
+   9) Delete directory
+ ${C_CYAN}Account${C_RST}
+  10) Account info
+  11) Storage locations
+  12) Set account ID
+  13) Show config
+   q) Quit
+
+EOF
+    ask "Choose an option: " || { printf '\n' >&2; break; }
+    choice="$ASK_REPLY"
+
+    # Every action runs in a subshell: an error ends the action, not the menu.
+    case "$choice" in
+      1)
+        ask_path "File path: " || break; a="$ASK_REPLY"
+        ask "Name to store it under [same as the file]: " || break
+        ( cmd_upload_anon "$a" "$ASK_REPLY" )
+        ;;
+      2)
+        ask "Target directory id: " || break; a="$ASK_REPLY"
+        list=()
+        hint "Enter one file path per line; an empty line starts the upload."
+        while ask_path "  file: " && [[ -n "$ASK_REPLY" ]]; do
+          list+=("$ASK_REPLY")
+        done
+        if [[ -z "$a" ]] || (( ${#list[@]} == 0 )); then
+          warn "Directory id and at least one file are required."
+        else
+          ( cmd_upload --dir "$a" -- "${list[@]}" )
+        fi
+        ;;
+      3) ( cmd_ls ) ;;
+      4)
+        ask "Directory id: " || break
+        if [[ -n "$ASK_REPLY" ]]; then ( cmd_ls "$ASK_REPLY" ); else warn "Directory id is required."; fi
+        ;;
+      5)
+        ask "New directory name: " || break; a="$ASK_REPLY"
+        ask "Parent directory id [root]: " || break
+        ( cmd_mkdir "$a" "$ASK_REPLY" )
+        ;;
+      6)
+        ask "Id of the file or directory: " || break; a="$ASK_REPLY"
+        ask "New name: " || break
+        ( cmd_rename "$a" "$ASK_REPLY" )
+        ;;
+      7)
+        ask "Id of the file or directory: " || break; a="$ASK_REPLY"
+        ask "Id of the new parent directory: " || break
+        ( cmd_move "$a" "$ASK_REPLY" )
+        ;;
+      8)
+        ask "File id: " || break; a="$ASK_REPLY"
+        ask "Note text: " || break
+        ( cmd_note "$a" "$ASK_REPLY" )
+        ;;
+      9)
+        ask "Directory id to delete: " || break
+        ( cmd_delete_dir "$ASK_REPLY" )
+        ;;
+      10) ( cmd_account ) ;;
+      11) ( cmd_locations ) ;;
+      12) ( cmd_set_token "" ) ;;
+      13) ( cmd_config ) ;;
+      q | Q | quit | exit) break ;;
+      "") ;;
+      *) warn "Unknown option: $choice" ;;
+    esac
+  done
+  hint "Bye."
+  return 0
+}
+
+########################################
+# Help
+########################################
+usage() {
+  cat <<EOF
+${O_BOLD}buzzheavier-cli ${VERSION}${O_RST} - command-line client for buzzheavier.com
+
+${O_BOLD}USAGE${O_RST}
+  ${PROG} [options] <command> [arguments]
+
+${O_BOLD}UPLOAD${O_RST}
+  ${O_CYAN}upload${O_RST} <file>... [-d <dirId>] [-n <name>] [-l <locationId>] [--note <text>]
+      Upload one or more files and print their download links.
+        -d, --dir <dirId>         upload into your directory (needs account ID);
+                                  without it the upload is anonymous
+        -n, --name <name>         store under another name (single file only)
+        -l, --location <id>       storage location (see: ${PROG} locations)
+        -N, --note <text>         note shown under the download link
+
+${O_BOLD}FILE MANAGER${O_RST} ${O_DIM}(needs account ID)${O_RST}
+  ${O_CYAN}ls${O_RST} [dirId]                    List the root or the given directory
+  ${O_CYAN}mkdir${O_RST} <name> [parentId]       Create a directory (default parent: root)
+  ${O_CYAN}rename${O_RST} <id> <newName>         Rename a file or directory
+  ${O_CYAN}mv${O_RST} <id> <newParentId>         Move a file or directory
+  ${O_CYAN}note${O_RST} <fileId> <text>          Set or replace the note of a file
+  ${O_CYAN}rm${O_RST} <dirId>...                 Delete directories including their contents
+
+${O_BOLD}ACCOUNT & SETUP${O_RST}
+  ${O_CYAN}account${O_RST}                       Show account information
+  ${O_CYAN}locations${O_RST}                     List storage locations (no account needed)
+  ${O_CYAN}set-token${O_RST} [account_id]        Save your account ID (prompts when omitted)
+  ${O_CYAN}unset-token${O_RST}                   Remove the saved account ID
+  ${O_CYAN}config${O_RST}                        Show configuration (account ID is masked)
+  ${O_CYAN}interactive${O_RST}                   Menu-driven mode
+  ${O_CYAN}help${O_RST}, ${O_CYAN}version${O_RST}
+
+${O_BOLD}OPTIONS${O_RST}
+      --json        Print the raw API response instead of formatted output
+  -q, --quiet       No progress or status messages (errors are still shown)
+  -y, --yes         Do not ask for confirmation before deleting
+      --no-color    Disable colours (also: NO_COLOR=1)
+  -h, --help        Show this help
+  -V, --version     Show the version
+      --            Treat everything after it as arguments, not options
+
+${O_BOLD}ENVIRONMENT${O_RST}
+  BUZZHEAVIER_ACCOUNT_ID      account ID (overrides the config file)
+  BUZZHEAVIER_API_BASE        default: https://buzzheavier.com/api
+  BUZZHEAVIER_UPLOAD_BASE     default: https://w.buzzheavier.com
+  BUZZHEAVIER_DOWNLOAD_BASE   default: https://buzzheavier.com
+
+${O_BOLD}EXAMPLES${O_RST}
+  ${PROG} upload video.mp4
+  ${PROG} upload *.zip -d <dirId>
+  ${PROG} upload report.pdf --note "final version" -l <locationId>
+  link=\$(${PROG} -q upload backup.tar.gz)
+  ${PROG} ls --json | jq '.data.children[].name'
+
+${O_BOLD}LEGACY COMMAND NAMES${O_RST} ${O_DIM}(still supported)${O_RST}
+  upload-anon, upload-auth, upload-loc, upload-note, bulk-upload, get-root,
+  get-dir, create-dir, rename-dir, rename-file, move, move-dir, move-file,
+  add-note-file, delete-dir, bulk-delete
+  Commands that need the account ID still accept it as a trailing argument.
+EOF
 }
 
 ########################################
 # Main
 ########################################
-load_token_from_config
+main() {
+  local -a args=() rest=()
+  local want_help=0 want_version=0 cmd="" a seen_ddash=0
 
-if [[ $# -lt 1 ]]; then
-  usage
-  exit 1
-fi
+  # Global options may appear anywhere before a literal `--`.
+  while (( $# )); do
+    case "$1" in
+      --json)         OPT_JSON=1 ;;
+      -q | --quiet)   OPT_QUIET=1 ;;
+      -y | --yes)     OPT_YES=1 ;;
+      --no-color)     OPT_NO_COLOR=1 ;;
+      -h | --help)    want_help=1 ;;
+      -V | --version) want_version=1 ;;
+      --) args+=("$@"); break ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
 
-COMMAND="$1"
-shift || true
+  setup_ui
 
-case "$COMMAND" in
-  help|-h|--help)
+  if (( want_version )); then
+    printf 'buzzheavier-cli %s\n' "$VERSION"
+    return 0
+  fi
+  if (( want_help )); then
     usage
-    ;;
+    return 0
+  fi
+  if (( ${#args[@]} == 0 )) || [[ "${args[0]}" == "--" ]]; then
+    usage >&2
+    return 2
+  fi
 
-  # Config
-  set-token)
-    set_token "${1:-}"
-    ;;
-  unset-token)
-    unset_token
-    ;;
-  config)
-    show_config
-    ;;
+  cmd="${args[0]}"
+  for a in "${args[@]:1}"; do
+    # `upload` parses `--` itself; for other commands just drop the first one.
+    if [[ "$a" == "--" && "$cmd" != "upload" ]] && (( ! seen_ddash )); then
+      seen_ddash=1
+      continue
+    fi
+    rest+=("$a")
+  done
 
-  # Interactive Mode
-  interactive)
-    interactive_menu
-    ;;
+  case "$cmd" in
+    help | version | config | set-token | unset-token) ;;
+    *) have curl || die "'curl' is required but was not found in PATH." ;;
+  esac
 
-  # Uploads
-  upload-anon)
-    upload_anon "$@"
-    ;;
-  upload-auth)
-    upload_auth "$@"
-    ;;
-  upload-loc)
-    upload_loc "$@"
-    ;;
-  upload-note)
-    upload_note "$@"
-    ;;
-  bulk-upload)
-    bulk_upload "$@"
-    ;;
+  load_token
 
-  # Public / Account
-  locations)
-    get_locations
-    ;;
-  account)
-    get_account "$@"
-    ;;
+  case "$cmd" in
+    help)        usage ;;
+    version)     printf 'buzzheavier-cli %s\n' "$VERSION" ;;
 
-  # File Manager (original names)
-  get-root)
-    get_root "$@"
-    ;;
-  get-dir)
-    get_directory "$@"
-    ;;
-  create-dir)
-    create_directory "$@"
-    ;;
-  rename-dir)
-    rename_item "$@"
-    ;;
-  move-dir)
-    move_item "$@"
-    ;;
-  rename-file)
-    rename_item "$@"
-    ;;
-  move-file)
-    move_item "$@"
-    ;;
-  add-note-file)
-    add_note_file "$@"
-    ;;
-  delete-dir)
-    delete_directory "$@"
-    ;;
-  bulk-delete)
-    bulk_delete_directories "$@"
-    ;;
+    # Setup
+    set-token)   cmd_set_token "${rest[0]:-}" ;;
+    unset-token) cmd_unset_token ;;
+    config)      cmd_config ;;
+    interactive) interactive_menu ;;
 
-  # Convenience aliases
-  ls)
-    ls_cmd "$@"
-    ;;
-  rename)
-    rename_item "$@"
-    ;;
-  move)
-    move_item "$@"
-    ;;
+    # Uploads
+    upload)      cmd_upload "${rest[@]}" ;;
+    upload-anon) cmd_upload_anon "${rest[@]}" ;;
+    upload-auth) cmd_upload_auth "${rest[@]}" ;;
+    upload-loc)  cmd_upload_loc "${rest[@]}" ;;
+    upload-note) cmd_upload_note "${rest[@]}" ;;
+    bulk-upload) cmd_bulk_upload "${rest[@]}" ;;
 
-  *)
-    err "Unknown command: $COMMAND"
-    usage
-    exit 1
-    ;;
-esac
+    # Public / account
+    locations)        cmd_locations ;;
+    account | whoami) cmd_account "${rest[0]:-}" ;;
+
+    # File manager
+    ls)       cmd_ls "${rest[0]:-}" "${rest[1]:-}" ;;
+    get-root) cmd_ls "" "${rest[0]:-}" ;;
+    get-dir)
+      [[ -n "${rest[0]:-}" ]] || die_usage "get-dir <directoryId> [account_id]"
+      cmd_ls "${rest[0]}" "${rest[1]:-}"
+      ;;
+    mkdir)      cmd_mkdir "${rest[@]}" ;;
+    create-dir)
+      (( ${#rest[@]} >= 2 )) || die_usage "create-dir <name> <parentId> [account_id]"
+      cmd_mkdir "${rest[@]}"
+      ;;
+    rename | rename-dir | rename-file) cmd_rename "${rest[@]}" ;;
+    mv | move | move-dir | move-file)  cmd_move "${rest[@]}" ;;
+    note | add-note-file)              cmd_note "${rest[@]}" ;;
+    rm | bulk-delete)                  cmd_rm "${rest[@]}" ;;
+    delete-dir)                        cmd_delete_dir "${rest[@]}" ;;
+
+    *)
+      err "Unknown command: $cmd"
+      printf "Run '%s help' to see the available commands.\n" "$PROG" >&2
+      return 2
+      ;;
+  esac
+}
+
+main "$@"
+exit $?

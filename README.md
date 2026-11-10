@@ -1,261 +1,289 @@
 # BuzzHeavier CLI
 
-A **Bash** command-line interface (CLI) for interacting with the [BuzzHeavier](https://buzzheavier.com) API.
+A **Bash** command-line client for the [BuzzHeavier](https://buzzheavier.com) API.
 
-- Anonymous uploads (no auth)
-- Authenticated uploads + file manager (requires your **Account ID** as Bearer token)
-- Bulk operations
+- Upload files anonymously or into your account, one or many at a time
+- Browse and manage your files: list, create, rename, move, annotate, delete
+- Prints just the download link on stdout, so it is easy to use in scripts
+- Formatted tables when `jq` is installed, raw JSON with `--json`
 - Interactive menu mode
-- `jq` is optional (pretty JSON if installed, raw output otherwise)
+
+```console
+$ ./buzzheavier.sh upload video.mp4
+→ Uploading video.mp4 (148.2 MB)
+######################################################################## 100.0%
+✔ Uploaded video.mp4
+https://buzzheavier.com/abc123def456
+```
 
 ---
 
 ## Table of Contents
 
-- [Features](#features)
 - [Installation](#installation)
 - [Configuration](#configuration)
-  - [Set token](#set-token)
-  - [Environment variables](#environment-variables)
 - [Usage](#usage)
-- [Commands Reference](#commands-reference)
-  - [Config / Help / Interactive](#config--help--interactive)
-  - [Uploads](#uploads)
-  - [Bulk Operations](#bulk-operations)
-  - [Public / Account](#public--account)
-  - [File Manager](#file-manager)
-  - [Aliases / Convenience Commands](#aliases--convenience-commands)
-- [Interactive Mode](#interactive-mode)
+- [Commands](#commands)
+  - [Upload](#upload)
+  - [File manager](#file-manager)
+  - [Account and setup](#account-and-setup)
+  - [Global options](#global-options)
+- [Scripting](#scripting)
+- [Interactive mode](#interactive-mode)
+- [Legacy command names](#legacy-command-names)
 - [Dependencies](#dependencies)
+- [Development](#development)
 - [License](#license)
-
----
-
-## Features
-
-1. **Store your token (Account ID)** in `~/.config/buzzheavier-cli/config`.
-2. **Anonymous uploads** – no token needed.
-3. **Authenticated uploads** – upload into a specific user directory (parentId).
-4. **File manager operations** – list, create, rename, move, set note, delete directories.
-5. **Bulk operations**
-   - Bulk upload multiple files
-   - Bulk delete multiple directories
-6. **Interactive mode** – menu-driven common operations.
-7. **Better UX**
-   - Optional `jq` (pretty-print if present)
-   - Shows HTTP status codes
-   - Safer config parsing (no `source`)
 
 ---
 
 ## Installation
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/Ognisty321/buzzheavier-cli.git
-   cd buzzheavier-cli
-   ```
+```bash
+git clone https://github.com/Ognisty321/buzzheavier-cli.git
+cd buzzheavier-cli
+chmod +x buzzheavier.sh
+```
 
-2. **Make the script executable**
+Optionally put it on your `PATH`:
 
-   ```bash
-   chmod +x buzzheavier.sh
-   ```
+```bash
+sudo install -m 755 buzzheavier.sh /usr/local/bin/buzzheavier
+```
 
-3. **(Optional) Install `jq`** for pretty-printing JSON
-
-   ```bash
-   # Ubuntu/Debian
-   sudo apt-get install jq
-   ```
+Optionally install `jq` to get formatted tables (`sudo apt-get install jq`, `brew install jq`, `winget install jqlang.jq`).
 
 ---
 
 ## Configuration
 
-### Set token
+Commands that work with your account use your **Account ID** as a Bearer token. Anonymous uploads and `locations` need no setup at all.
 
-Authenticated endpoints use your **Account ID** as a Bearer token.
+Save it once:
 
 ```bash
-./buzzheavier.sh set-token "YOUR_ACCOUNT_ID"
+./buzzheavier.sh set-token
 ```
 
-This writes to:
+The command prompts for the ID without echoing it, so it stays out of your shell history. You can also pass it as an argument (`set-token YOUR_ACCOUNT_ID`) or pipe it in.
 
-```text
-~/.config/buzzheavier-cli/config
-```
-
-Format:
+It is stored in `~/.config/buzzheavier-cli/config` (or under `$XDG_CONFIG_HOME`) with permissions `600`:
 
 ```text
 ACCOUNT_ID=YOUR_ACCOUNT_ID
 ```
 
-Other useful config commands:
+Related commands:
 
 ```bash
-./buzzheavier.sh config       # show config status (does not print full token)
-./buzzheavier.sh unset-token  # remove config file
+./buzzheavier.sh config       # show where the ID comes from (masked) and which endpoints are used
+./buzzheavier.sh account      # check that the ID works
+./buzzheavier.sh unset-token  # remove the saved ID
 ```
 
 ### Environment variables
 
-You can override defaults using environment variables:
-
-* `BUZZHEAVIER_ACCOUNT_ID` – token (Account ID)
-* `BUZZHEAVIER_API_BASE` – default: `https://buzzheavier.com/api`
-* `BUZZHEAVIER_UPLOAD_BASE` – default: `https://w.buzzheavier.com`
-* `BUZZHEAVIER_DOWNLOAD_BASE` – default: `https://buzzheavier.com`
-
-Example:
-
-```bash
-export BUZZHEAVIER_ACCOUNT_ID="YOUR_ACCOUNT_ID"
-./buzzheavier.sh account
-```
+| Variable                    | Purpose                                         |
+| --------------------------- | ----------------------------------------------- |
+| `BUZZHEAVIER_ACCOUNT_ID`    | Account ID; takes precedence over the config file |
+| `BUZZHEAVIER_API_BASE`      | default: `https://buzzheavier.com/api`          |
+| `BUZZHEAVIER_UPLOAD_BASE`   | default: `https://w.buzzheavier.com`            |
+| `BUZZHEAVIER_DOWNLOAD_BASE` | default: `https://buzzheavier.com`              |
+| `NO_COLOR`                  | set to any value to disable colours             |
 
 ---
 
 ## Usage
 
 ```bash
-./buzzheavier.sh <command> [arguments...]
-```
-
-See built-in help:
-
-```bash
+./buzzheavier.sh [options] <command> [arguments]
 ./buzzheavier.sh help
-# or
-./buzzheavier.sh -h
 ```
 
-Example invocations:
+Quick tour:
 
 ```bash
-# Anonymous upload (no token)
-./buzzheavier.sh upload-anon ./myvideo.mp4 myvideo.mp4
+# Anonymous upload - prints the download link
+./buzzheavier.sh upload video.mp4
 
-# Authenticated upload to a parent directory
-./buzzheavier.sh upload-auth ./myvideo.mp4 parent123 myvideo.mp4
+# Several files into one of your directories
+./buzzheavier.sh upload *.zip -d <dirId>
 
-# Upload with a note (note is base64 encoded and URL-safe)
-./buzzheavier.sh upload-note ./myvideo.mp4 myvideo.mp4 "hello from buzzheavier"
+# Different name, a note and a specific storage location
+./buzzheavier.sh upload report.pdf -n "Report 2025.pdf" --note "final version" -l <locationId>
 
-# List root directory (auth)
-./buzzheavier.sh get-root
-
-# List a directory (auth)
-./buzzheavier.sh get-dir directory123
-
-# Or use ls alias:
+# Browse and manage
 ./buzzheavier.sh ls
-./buzzheavier.sh ls directory123
+./buzzheavier.sh ls <dirId>
+./buzzheavier.sh mkdir "Holiday photos"
+./buzzheavier.sh rename <id> "new name.mp4"
+./buzzheavier.sh mv <id> <newParentId>
+./buzzheavier.sh rm <dirId>
 ```
 
 ---
 
-## Commands Reference
+## Commands
 
-### Config / Help / Interactive
+### Upload
 
-| Command                  | Description                                       |
-| ------------------------ | ------------------------------------------------- |
-| `help` / `-h` / `--help` | Show help + command list                          |
-| `set-token <account_id>` | Save Account ID token to config                   |
-| `unset-token`            | Remove saved token/config                         |
-| `config`                 | Print config status (token source + masked token) |
-| `interactive`            | Launch menu-driven interactive mode               |
+```text
+upload <file>... [-d <dirId>] [-n <name>] [-l <locationId>] [--note <text>]
+```
 
-### Uploads
+| Option                  | Description                                                                 |
+| ----------------------- | --------------------------------------------------------------------------- |
+| `-d`, `--dir <dirId>`   | Upload into one of your directories (needs the account ID). Without it the upload is anonymous. |
+| `-n`, `--name <name>`   | Store the file under another name (single file only). Default: the file's own name. |
+| `-l`, `--location <id>` | Storage location, see `locations`.                                          |
+| `-N`, `--note <text>`   | Note shown under the download link (max 500 characters).                    |
 
-| Command                                                     | Description                               |
-| ----------------------------------------------------------- | ----------------------------------------- |
-| `upload-anon <filePath> <fileName>`                         | Anonymous upload as `<fileName>`          |
-| `upload-auth <filePath> <parentId> <fileName> [account_id]` | Auth upload into directory `<parentId>`   |
-| `upload-loc <filePath> <fileName> <locationId>`             | Upload to a specific storage location     |
-| `upload-note <filePath> <fileName> <noteString>`            | Upload with a note (base64 + URL-encoded) |
+File names are URL-encoded automatically, so spaces and non-ASCII characters work. BuzzHeavier itself refuses a few characters in names (for example `#`); in that case choose another name with `-n`. When several files are given, a failed one does not stop the others; the exit code is non-zero if any of them failed.
 
-### Bulk Operations
+### File manager
 
-| Command                                      | Description                                  |
-| -------------------------------------------- | -------------------------------------------- |
-| `bulk-upload <parentId> <file1> [file2] ...` | Bulk upload multiple files into `<parentId>` |
-| `bulk-delete <dirId1> [dirId2] ...`          | Bulk delete directories                      |
+All of these need the account ID.
 
-### Public / Account
+| Command                   | Description                                                        |
+| ------------------------- | ------------------------------------------------------------------ |
+| `ls [dirId]`              | List the root directory or the given directory                     |
+| `mkdir <name> [parentId]` | Create a directory and print its ID. Without `parentId` it is created in the root directory (this lookup needs `jq`). |
+| `rename <id> <newName>`   | Rename a file or directory                                         |
+| `mv <id> <newParentId>`   | Move a file or directory                                           |
+| `note <fileId> <text>`    | Set or replace the note of a file                                  |
+| `rm <dirId>...`           | Delete directories **including everything inside them**            |
 
-| Command                | Description                               |
-| ---------------------- | ----------------------------------------- |
-| `locations`            | List storage locations (no auth required) |
-| `account [account_id]` | Get account info (auth)                   |
+`rm` asks for confirmation when run in a terminal. Pass `-y` to skip the question. When input is not a terminal (scripts, pipes) it does not ask.
 
-### File Manager
+### Account and setup
 
-| Command                                             | Description                                  |
-| --------------------------------------------------- | -------------------------------------------- |
-| `get-root [account_id]`                             | List root directory (auth)                   |
-| `get-dir <directoryId> [account_id]`                | List directory contents (auth)               |
-| `create-dir <name> <parentId> [account_id]`         | Create directory `<name>` under `<parentId>` |
-| `rename-dir <directoryId> <newName> [account_id]`   | Rename a directory                           |
-| `move-dir <directoryId> <newParentId> [account_id]` | Move a directory                             |
-| `rename-file <fileId> <newName> [account_id]`       | Rename a file                                |
-| `move-file <fileId> <newParentId> [account_id]`     | Move a file                                  |
-| `add-note-file <fileId> <noteString> [account_id]`  | Add/change a file note                       |
-| `delete-dir <directoryId> [account_id]`             | Delete a directory (and subdirectories)      |
+| Command                  | Description                                          |
+| ------------------------ | ---------------------------------------------------- |
+| `account`                | Show account information                             |
+| `locations`              | List storage locations (no account needed)           |
+| `set-token [account_id]` | Save the account ID (prompts when omitted)           |
+| `unset-token`            | Remove the saved account ID                          |
+| `config`                 | Show the configuration; the account ID is masked     |
+| `interactive`            | Menu-driven mode                                     |
+| `help`, `version`        | Help and version                                     |
 
-### Aliases / Convenience Commands
+### Global options
 
-These are shortcuts over the same underlying API endpoints:
+| Option            | Description                                                    |
+| ----------------- | -------------------------------------------------------------- |
+| `--json`          | Print the raw API response instead of formatted output         |
+| `-q`, `--quiet`   | No progress or status messages (errors are still shown)        |
+| `-y`, `--yes`     | Do not ask for confirmation before deleting                    |
+| `--no-color`      | Disable colours                                                |
+| `-h`, `--help`    | Show help                                                      |
+| `-V`, `--version` | Show the version                                               |
+| `--`              | Treat everything after it as arguments, e.g. a file called `-q` |
 
-| Command                                | Description                      |
-| -------------------------------------- | -------------------------------- |
-| `ls [directoryId] [account_id]`        | Alias for `get-root` / `get-dir` |
-| `rename <id> <newName> [account_id]`   | Generic rename for file/dir IDs  |
-| `move <id> <newParentId> [account_id]` | Generic move for file/dir IDs    |
+Options can be placed before or after the command.
 
 ---
 
-## Interactive Mode
+## Scripting
 
-Run:
+The CLI is built to be used from scripts:
+
+- **stdout** carries only the result: download links, tables, IDs or JSON.
+- **stderr** carries progress, status and error messages.
+- **Exit code** is `0` on success, `1` on failure (network error or an error response from the API) and `2` for wrong usage.
+
+```bash
+# Capture the link of an upload
+link=$(./buzzheavier.sh -q upload backup.tar.gz) || echo "upload failed" >&2
+
+# Create a directory and upload into it
+dir=$(./buzzheavier.sh mkdir "Backups $(date +%F)")
+./buzzheavier.sh upload *.tar.gz -d "$dir"
+
+# Work with the raw API response
+./buzzheavier.sh ls --json | jq -r '.data.children[].name'
+```
+
+The account ID is passed to `curl` on standard input rather than as a command-line argument, so it is not visible to other users in the process list.
+
+---
+
+## Interactive mode
 
 ```bash
 ./buzzheavier.sh interactive
 ```
 
-Menu:
+```text
+Buzzheavier CLI v2.0.0 - account ID: ab…wxyz
 
+ Upload
+   1) Upload a file (anonymous)
+   2) Upload file(s) into a directory
+ Browse
+   3) List root directory
+   4) List a directory
+ Manage
+   5) Create directory
+   6) Rename file or directory
+   7) Move file or directory
+   8) Set a file note
+   9) Delete directory
+ Account
+  10) Account info
+  11) Storage locations
+  12) Set account ID
+  13) Show config
+   q) Quit
+
+Choose an option:
 ```
-========== Buzzheavier CLI Interactive Menu ==========
- 1) Set Token
- 2) Show Account Info
- 3) Upload File (Anon)
- 4) Upload File (Auth)
- 5) Bulk Upload (Auth)
- 6) List Root Directory
- 7) Create Directory
- 8) Delete Directory
- 9) Bulk Delete Directories
-10) Get Storage Locations
-11) Show Config
-12) Quit
-======================================================
-Choose an option (1-12):
-```
+
+---
+
+## Legacy command names
+
+The command names of version 1 keep working, with the same arguments:
+
+| Legacy command                                              | Now                          |
+| ----------------------------------------------------------- | ---------------------------- |
+| `upload-anon <filePath> [fileName]`                         | `upload <file> [-n <name>]`  |
+| `upload-auth <filePath> <parentId> [fileName] [account_id]` | `upload <file> -d <dirId>`   |
+| `upload-loc <filePath> <fileName> <locationId>`             | `upload <file> -l <id>`      |
+| `upload-note <filePath> <fileName> <noteString>`            | `upload <file> --note <text>` |
+| `bulk-upload <parentId> <file1> [file2] ...`                | `upload <file>... -d <dirId>` |
+| `get-root [account_id]`, `get-dir <directoryId> [account_id]` | `ls [dirId]`               |
+| `create-dir <name> <parentId> [account_id]`                 | `mkdir <name> [parentId]`    |
+| `rename-dir`, `rename-file <id> <newName> [account_id]`     | `rename <id> <newName>`      |
+| `move`, `move-dir`, `move-file <id> <newParentId> [account_id]` | `mv <id> <newParentId>`  |
+| `add-note-file <fileId> <noteString> [account_id]`          | `note <fileId> <text>`       |
+| `delete-dir <directoryId> [account_id]`                     | `rm <dirId>`                 |
+| `bulk-delete <dirId1> [dirId2] ...`                         | `rm <dirId>...`              |
+
+Differences from version 1 that scripts may notice:
+
+- Status messages (`Uploading ...`) now go to stderr, and uploads print only the download link on stdout. Use `--json` to get the API response as before.
+- Failed requests now return a non-zero exit code.
+- `delete-dir` and `bulk-delete` ask for confirmation when run in a terminal (`-y` skips it).
 
 ---
 
 ## Dependencies
 
-* Bash 4.0+
-* `curl`
-* `jq` *(optional)* for pretty JSON
-* `base64` **or** `openssl` (needed for note encoding)
+- Bash and `curl`
+- `jq` *(optional)* - formatted tables and `mkdir` without a parent ID
+- `base64` **or** `openssl` - only for upload notes
 
-Linux/macOS should have most of these available. On Windows, use **WSL** or **Git Bash**.
+Tested with Bash 5 on Linux and on Windows (Git Bash and WSL). The script avoids Bash 4+ only features, so the Bash 3.2 that ships with macOS should work too.
+
+---
+
+## Development
+
+The test suite runs every command against a small local mock of the API, so nothing is sent to buzzheavier.com:
+
+```bash
+bash tests/run.sh    # needs python3
+```
 
 ---
 

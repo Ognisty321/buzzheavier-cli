@@ -1,0 +1,4 @@
+# Shell and Python scripts must keep LF line endings, also on Windows checkouts
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
