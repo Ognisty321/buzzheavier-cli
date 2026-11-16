@@ -3,8 +3,9 @@
 A **Bash** command-line client for the [BuzzHeavier](https://buzzheavier.com) API.
 
 - Upload files anonymously or into your account, one or many at a time
+- Download files from BuzzHeavier links, with resume
 - Browse and manage your files: list, create, rename, move, annotate, delete
-- Prints just the download link on stdout, so it is easy to use in scripts
+- Prints just the result (download link, saved path) on stdout, so it is easy to use in scripts
 - Formatted tables when `jq` is installed, raw JSON with `--json`
 - Interactive menu mode
 
@@ -25,6 +26,7 @@ https://buzzheavier.com/abc123def456
 - [Usage](#usage)
 - [Commands](#commands)
   - [Upload](#upload)
+  - [Download](#download)
   - [File manager](#file-manager)
   - [Account and setup](#account-and-setup)
   - [Global options](#global-options)
@@ -112,6 +114,10 @@ Quick tour:
 # Different name, a note and a specific storage location
 ./buzzheavier.sh upload report.pdf -n "Report 2025.pdf" --note "final version" -l <locationId>
 
+# Download a file from its link (run it again to resume an interrupted download)
+./buzzheavier.sh download https://buzzheavier.com/<id>
+./buzzheavier.sh download <id> -o ~/Downloads/
+
 # Browse and manage
 ./buzzheavier.sh ls
 ./buzzheavier.sh ls <dirId>
@@ -139,6 +145,42 @@ upload <file>... [-d <dirId>] [-n <name>] [-l <locationId>] [--note <text>]
 | `-N`, `--note <text>`   | Note shown under the download link (max 500 characters).                    |
 
 File names are URL-encoded automatically, so spaces and non-ASCII characters work. BuzzHeavier itself refuses a few characters in names (for example `#`); in that case choose another name with `-n`. When several files are given, a failed one does not stop the others; the exit code is non-zero if any of them failed.
+
+### Download
+
+```text
+download <link|id>... [-o <file|dir>] [-f] [--alt]
+```
+
+Aliases: `dl`, `get`. Takes full links (`https://buzzheavier.com/<id>`), bare file IDs or direct file links, saves each file under its original name and prints the path it was saved to. No account ID is needed.
+
+| Option                  | Description                                                                 |
+| ----------------------- | --------------------------------------------------------------------------- |
+| `-o`, `--output <path>` | A file name, or a directory to save into (existing, or ending with `/`). `-` writes the file to stdout. Default: the current directory. |
+| `-f`, `--force`         | Overwrite an existing file. Without it an existing file is never touched.   |
+| `--alt`                 | Use the site's alternative download server ("mirror 2").                    |
+
+```console
+$ ./buzzheavier.sh download https://buzzheavier.com/abc123def456 -o ~/Downloads/
+→ Downloading video.mp4 (148.2MB)
+######################################################################## 100.0%
+✔ Saved /home/me/Downloads/video.mp4 (148.2 MB)
+/home/me/Downloads/video.mp4
+```
+
+- **Resume:** data is written to `<name>.part` first. If a download is interrupted, run the same command again and it continues where it stopped.
+- **File names** come from the server and are cleaned up before use: path separators and control characters are removed, so a file can only ever land in the directory you chose.
+- **Only single files:** links to directories are not supported.
+
+> BuzzHeavier has no download API, so this command reads the public file page the same way a browser does. The site sometimes answers automated clients with a browser check instead of the page; the CLI then stops with an explanation rather than trying to get around it. In testing this depended on the `curl` build: `curl` on Windows (Git Bash) got through, `curl` on Linux (WSL) was blocked. If the site changes its pages, this command may need an update.
+
+**When the browser check gets in the way**, open the file page in your browser, click **Copy download link** and give that direct link to the CLI. It skips the file page entirely, and name detection, `-o`, `--force` and resume work the same:
+
+```bash
+./buzzheavier.sh download "https://<server>/d/<id>?v=<token>" -o ~/Downloads/
+```
+
+Direct links expire after a while; copy a fresh one if it is refused.
 
 ### File manager
 
@@ -199,7 +241,7 @@ Options can be placed before or after the command.
 
 The CLI is built to be used from scripts:
 
-- **stdout** carries only the result: download links, tables, IDs or JSON.
+- **stdout** carries only the result: download links, paths of downloaded files, tables, IDs or JSON.
 - **stderr** carries progress, status and error messages.
 - **Exit code** is `0` on success, `1` on failure (network error or an error response from the API) and `2` for wrong usage.
 
@@ -210,6 +252,9 @@ link=$(./buzzheavier.sh -q upload backup.tar.gz) || echo "upload failed" >&2
 # Create a directory and upload into it
 dir=$(./buzzheavier.sh mkdir "Backups $(date +%F)")
 ./buzzheavier.sh upload *.tar.gz -d "$dir"
+
+# Download and unpack without keeping the archive
+./buzzheavier.sh -q download <id> -o - | tar xz
 
 # Work with the raw API response
 ./buzzheavier.sh ls --json | jq -r '.data.children[].name'
@@ -226,25 +271,27 @@ The account ID is passed to `curl` on standard input rather than as a command-li
 ```
 
 ```text
-Buzzheavier CLI v2.0.0 - account ID: ab…wxyz
+Buzzheavier CLI v2.1.0 - account ID: ab…wxyz
 
  Upload
    1) Upload a file (anonymous)
    2) Upload file(s) into a directory
+ Download
+   3) Download a file from a link
  Browse
-   3) List root directory
-   4) List a directory
+   4) List root directory
+   5) List a directory
  Manage
-   5) Create directory
-   6) Rename file or directory
-   7) Move file or directory
-   8) Set a file note
-   9) Delete directory
+   6) Create directory
+   7) Rename file or directory
+   8) Move file or directory
+   9) Set a file note
+  10) Delete file or directory
  Account
-  10) Account info
-  11) Storage locations
-  12) Set account ID
-  13) Show config
+  11) Account info
+  12) Storage locations
+  13) Set account ID
+  14) Show config
    q) Quit
 
 Choose an option:
@@ -285,6 +332,7 @@ Differences from version 1 that scripts may notice:
 - Bash and `curl`
 - `jq` *(optional)* - formatted tables and `mkdir` without a parent ID
 - `base64` **or** `openssl` - only for upload notes
+- `grep`, `sed`, `tr` - only for downloads (present on any Unix-like system)
 
 Tested with Bash 5 on Linux and on Windows (Git Bash and WSL). The script avoids Bash 4+ only features, so the Bash 3.2 that ships with macOS should work too.
 

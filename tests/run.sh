@@ -260,6 +260,120 @@ run delete-dir d1;                   check "delete-dir" "$(req_field 1)" "DELETE
 run bulk-delete d1 d2;               check "bulk-delete" "$(req_field 2)" "/api/fs/d2"
 unset BUZZHEAVIER_ACCOUNT_ID
 
+echo "== download"
+DL="$WORK/dl"
+mkdir -p "$DL/cwd"
+"$PYTHON" -c 'import sys; sys.stdout.buffer.write(bytes((i * 7 + 3) % 251 for i in range(5000)))' > "$WORK/expected.bin"
+DL_NAME="it's a zażółć & co.txt"
+same() { if cmp -s "$2" "$WORK/expected.bin"; then pass; else fail "$1 (content differs: $2)"; fi; }
+absent() { if [[ ! -e "$2" ]]; then pass; else fail "$1 (exists: $2)"; fi; }
+
+run download "$BASE/dlfile000001" -o "$DL/"
+check "download exit code" "$RC" 0
+check "stdout is the saved path" "$OUT" "$DL/$DL_NAME"
+same "downloaded file is complete" "$DL/$DL_NAME"
+absent "no .part file is left behind" "$DL/$DL_NAME.part"
+check "file comes from the redirect target" "$(req_field 2)" "/d/dlfile000001?v=secret"
+check "download sends no account id" "$(req_field 3)" "-"
+contains "size from the page is shown" "$ERR" "4.9KB"
+
+before="$(req_count)"
+run download "$BASE/dlfile000001" -o "$DL/"
+check "existing file is not overwritten" "$RC" 1
+contains "existing file is explained" "$ERR" "already exists"
+check "nothing is transferred for an existing file" "$(( $(req_count) - before ))" 1
+run download "$BASE/dlfile000001" -o "$DL/" --force
+check "--force overwrites" "$RC" 0
+
+BUZZHEAVIER_DOWNLOAD_BASE="$BASE" run dl dlfile000001 -o "$DL/custom.bin"
+check "bare id + custom file name: exit code" "$RC" 0
+check "custom file name is used" "$OUT" "$DL/custom.bin"
+same "custom file name: content" "$DL/custom.bin"
+
+OUT="$(cd "$DL/cwd" && "$CLI" download "$BASE/dlfile000001" 2>"$WORK/stderr" </dev/null)"; RC=$?; ERR="$(cat "$WORK/stderr")"
+check "default target is the current directory" "$OUT" "$DL_NAME"
+same "current directory: content" "$DL/cwd/$DL_NAME"
+
+head -c 1000 "$WORK/expected.bin" > "$DL/resume.bin.part"
+run download "$BASE/dlfile000001" -o "$DL/resume.bin"
+check "resume exit code" "$RC" 0
+check "resume asks only for the missing bytes" "$(req_field 5)" "range=bytes=1000-"
+same "resumed file is complete" "$DL/resume.bin"
+contains "resume is announced" "$ERR" "Resuming"
+
+cp "$WORK/expected.bin" "$DL/done.bin.part"
+run download "$BASE/dlfile000001" -o "$DL/done.bin"
+check "already complete .part file: exit code" "$RC" 0
+same "already complete .part file: content" "$DL/done.bin"
+
+printf 'stale' > "$DL/forced.bin.part"
+run download "$BASE/dlfile000001" -o "$DL/forced.bin" --force
+check "--force discards a stale .part file" "$(req_field 5)" "range=-"
+same "--force: content" "$DL/forced.bin"
+
+"$CLI" -q download "$BASE/dlfile000001" -o - > "$WORK/stdout.bin" 2>"$WORK/stderr" </dev/null; RC=$?
+OUT="(binary)"; ERR="$(cat "$WORK/stderr")"
+check "-o - exit code" "$RC" 0
+same "-o - writes the file to stdout" "$WORK/stdout.bin"
+check "-q -o - prints nothing else" "$ERR" ""
+
+run download "$BASE/dlfile000001" -o "$DL/alt.bin" --alt
+check "--alt exit code" "$RC" 0
+check "--alt uses the alternative link" "$(req_field 2)" "/d/dlfile000001?v=secret&alt=1"
+
+run download "$BASE/dlfile000002" -o "$DL/safe/"
+check "hostile file name: exit code" "$RC" 0
+check "path separators in the name are neutralised" "$OUT" "$DL/safe/.._evil.txt"
+absent "nothing is written outside the target directory" "$DL/evil.txt"
+
+run download "$BASE/dlfile000001" "$BASE/gone00000000" -o "$DL/multi/"
+check "partial failure returns 1" "$RC" 1
+same "the good link is still downloaded" "$DL/multi/$DL_NAME"
+contains "partial failure is summarised" "$ERR" "1 of 2"
+run download "$BASE/dlfile000001" "$BASE/dlfile000002" -o "$DL/one-file.bin"
+check "several links need a directory" "$RC" 1
+
+run download "$BASE/gone00000000"
+check "missing file fails" "$RC" 1
+contains "missing file is explained" "$ERR" "not found"
+run download "$BASE/nolink000000"
+check "page without a download link fails" "$RC" 1
+contains "page without a link is explained" "$ERR" "No download link"
+run download "$BASE/challenge000"
+check "browser check fails cleanly" "$RC" 1
+contains "browser check is explained" "$ERR" "browser check"
+contains "browser check suggests the direct link" "$ERR" "Copy download link"
+run download "$BASE/badtoken0000" -o "$DL/"
+check "refused download link fails" "$RC" 1
+contains "refused link is explained" "$ERR" "did not hand out"
+run download "$BASE/brokenfile00" -o "$DL/broken.bin"
+check "server error during transfer fails" "$RC" 1
+contains "transfer error shows the status" "$ERR" "HTTP 500"
+absent "no file after a failed transfer" "$DL/broken.bin"
+absent "no empty .part after a failed transfer" "$DL/broken.bin.part"
+check "nothing on stdout after a failed download" "$OUT" ""
+before="$(req_count)"
+run download "$BASE/d/dlfile000001?v=secret" -o "$DL/direct/"
+check "direct link: exit code" "$RC" 0
+check "direct link: name comes from the response headers" "$OUT" "$DL/direct/$DL_NAME"
+same "direct link: content" "$DL/direct/$DL_NAME"
+check "direct link: the file page is not requested" "$(( $(req_count) - before ))" 2
+head -c 2000 "$WORK/expected.bin" > "$DL/direct-resume.bin.part"
+run download "$BASE/d/dlfile000001?v=secret" -o "$DL/direct-resume.bin"
+check "direct link: resume" "$(req_field 5)" "range=bytes=2000-"
+same "direct link: resumed content" "$DL/direct-resume.bin"
+run download "$BASE/d/dlfile000002?v=secret" -o "$DL/direct-safe/"
+check "direct link: hostile name is neutralised" "$OUT" "$DL/direct-safe/.._evil.txt"
+run download "$BASE/d/dlfile000001?v=expired" -o "$DL/expired/"
+check "expired direct link fails" "$RC" 1
+contains "expired direct link is explained" "$ERR" "expire"
+run download "not a link"
+check "garbage instead of a link fails" "$RC" 1
+run download
+check "download without arguments is a usage error" "$RC" 2
+run download "$BASE/dlfile000001" --bogus
+check "unknown download option is a usage error" "$RC" 2
+
 echo "== configuration"
 before="$(req_count)"
 run account
@@ -292,12 +406,15 @@ check "unset-token exit code" "$RC" 0
 if [[ ! -e "$HOME/.config/buzzheavier-cli/config" ]]; then pass; else fail "config file is removed"; fi
 
 echo "== interactive mode"
-OUT="$(printf '11\nq\n' | "$CLI" interactive 2>"$WORK/stderr")"; RC=$?; ERR="$(cat "$WORK/stderr")"
+OUT="$(printf '12\nq\n' | "$CLI" interactive 2>"$WORK/stderr")"; RC=$?; ERR="$(cat "$WORK/stderr")"
 check "interactive exit code" "$RC" 0
 contains "interactive runs the chosen action" "$OUT" "loc000000001"
-OUT="$(printf '10\n4\nmissing\n11\n' | "$CLI" interactive 2>"$WORK/stderr")"; RC=$?; ERR="$(cat "$WORK/stderr")"
+OUT="$(printf '11\n5\nmissing\n12\n' | "$CLI" interactive 2>"$WORK/stderr")"; RC=$?; ERR="$(cat "$WORK/stderr")"
 check "interactive ends on EOF" "$RC" 0
 contains "a failing action does not end the menu" "$OUT" "loc000000001"
+OUT="$(printf '3\n%s\n%s\nq\n' "$BASE/dlfile000001" "$DL/menu/" | "$CLI" interactive 2>"$WORK/stderr")"; RC=$?; ERR="$(cat "$WORK/stderr")"
+check "interactive download exit code" "$RC" 0
+same "interactive download saves the file" "$DL/menu/$DL_NAME"
 
 if (( have_jq )); then
   echo "== formatted output (jq)"

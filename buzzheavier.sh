@@ -7,6 +7,7 @@
 #   - bash, curl
 #   - jq (optional: formatted tables; without it raw JSON is printed)
 #   - base64 or openssl (only for upload notes)
+#   - grep, sed, tr (only for downloads)
 #
 # Output contract:
 #   - results (download links, tables, JSON) go to stdout
@@ -14,10 +15,12 @@
 #   - exit code: 0 success, 1 failure (network / API error), 2 usage error
 #
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 PROG="${0##*/}"
 
 set -o pipefail
+# Bash 5.2+ gives "&" a meaning in ${var//pattern/replacement}; keep it literal.
+shopt -u patsub_replacement 2>/dev/null || true
 
 ########################################
 # Configuration & global state
@@ -33,6 +36,7 @@ CONNECT_TIMEOUT=20   # seconds, every request
 API_TIMEOUT=60       # seconds, API calls only (uploads have no time limit)
 MAX_NAME_LEN=500
 MAX_NOTE_LEN=500
+CURL_COMMON=(--globoff --connect-timeout "$CONNECT_TIMEOUT" -A "buzzheavier-cli/${VERSION}")
 
 LEGACY_CONFIG_FILE="${HOME}/.config/buzzheavier-cli/config"
 CONFIG_FILE="${XDG_CONFIG_HOME:-${HOME}/.config}/buzzheavier-cli/config"
@@ -365,28 +369,42 @@ cmd_config() {
 status_ok() { [[ "$1" =~ ^2[0-9][0-9]$ ]]; }
 
 # http_request <token|""> <curl args...>
-# Sets HTTP_STATUS and RESP_BODY; returns curl's exit code.
+# Sets HTTP_STATUS and RESP_BODY; returns curl's exit code (HTTP_STATUS is
+# set even when curl itself fails, e.g. with --fail).
 # Call it directly (not in $(...)), otherwise the globals are lost.
 # The token is handed to curl on stdin, so it never shows up in `ps` output.
 http_request() {
   local token="$1"; shift
   local out rc
-  local -a base=(--globoff --connect-timeout "$CONNECT_TIMEOUT" -A "buzzheavier-cli/${VERSION}")
 
   HTTP_STATUS=""
   RESP_BODY=""
   if [[ -n "$token" ]]; then
-    out=$(curl "${base[@]}" "$@" -w $'\n%{http_code}' --config - \
+    out=$(curl "${CURL_COMMON[@]}" "$@" -w $'\n%{http_code}' --config - \
       <<<"header = \"Authorization: Bearer ${token}\"")
     rc=$?
   else
-    out=$(curl "${base[@]}" "$@" -w $'\n%{http_code}')
+    out=$(curl "${CURL_COMMON[@]}" "$@" -w $'\n%{http_code}')
     rc=$?
   fi
-  (( rc == 0 )) || return "$rc"
   HTTP_STATUS="${out##*$'\n'}"
+  (( rc == 0 )) || return "$rc"
   RESP_BODY="${out%$'\n'*}"
   return 0
+}
+
+# Git Bash / Cygwin: hand curl a Windows-style path. The automatic path
+# conversion of MSYS gives up on names containing characters like {} or #.
+native_path() {
+  local p="$1" converted
+  case "${OSTYPE:-}" in
+    msys* | cygwin*)
+      if have cygpath && converted="$(cygpath -m -- "$p" 2>/dev/null)" && [[ -n "$converted" ]]; then
+        p="$converted"
+      fi
+      ;;
+  esac
+  printf '%s' "$p"
 }
 
 # Turn a non-2xx answer into an error message + non-zero return.
@@ -447,17 +465,8 @@ do_upload() {
   fi
   [[ -n "$query" ]] && url+="?${query:1}"
 
-  local src="$file"
-  # Git Bash / Cygwin: hand curl a Windows-style path. The automatic path
-  # conversion of MSYS gives up on names containing characters like {} or #.
-  case "${OSTYPE:-}" in
-    msys* | cygwin*)
-      if have cygpath; then
-        src="$(cygpath -m -- "$file" 2>/dev/null)" || src="$file"
-        [[ -n "$src" ]] || src="$file"
-      fi
-      ;;
-  esac
+  local src
+  src="$(native_path "$file")"
   # curl treats "-T -" and "-T ." as stdin; make bare names unambiguous.
   [[ "$src" == */* ]] || src="./$src"
 
@@ -570,6 +579,317 @@ cmd_bulk_upload() {
   (( $# >= 2 )) || die_usage "bulk-upload <parentId> <file1> [file2] ..."
   local parent="$1"; shift
   cmd_upload --dir "$parent" -- "$@"
+}
+
+########################################
+# Downloads
+########################################
+# BuzzHeavier has no download API. The file page carries the file name and a
+# short-lived link; requesting that link the way the page does (as an htmx
+# request) answers with an HX-Redirect header pointing at the real file.
+# A direct file link copied in a browser skips both steps.
+
+DL_ORIGIN=""
+DL_ID=""
+
+# parse_link <link|id>   Sets DL_ORIGIN and DL_ID; returns 1 if it is neither.
+parse_link() {
+  local s="$1" rest
+  DL_ORIGIN="$DOWNLOAD_BASE"
+  DL_ID=""
+  # "buzzheavier.com/abc123" without a scheme
+  if [[ "$s" != *://* && "$s" == *.*/* ]]; then
+    s="https://$s"
+  fi
+  case "$s" in
+    http://* | https://*)
+      rest="${s#*://}"
+      [[ "$rest" == */* ]] || return 1
+      DL_ORIGIN="${s%%://*}://${rest%%/*}"
+      s="${rest#*/}"
+      ;;
+  esac
+  s="${s%%[?#]*}"
+  s="${s%%/*}"
+  [[ "$s" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  DL_ID="$s"
+}
+
+# Decode the HTML entities that can show up in a page title.
+html_unescape() {
+  local s="$1" code char re='&#([0-9]+);' dq='"' sq="'"
+  s="${s//&lt;/<}"
+  s="${s//&gt;/>}"
+  s="${s//&quot;/$dq}"
+  s="${s//&apos;/$sq}"
+  while [[ "$s" =~ $re ]]; do
+    code="${BASH_REMATCH[1]}"
+    char="_"
+    if (( ${#code} <= 3 && 10#$code >= 32 && 10#$code < 127 )); then
+      printf -v char '%b' "\\0$(printf '%03o' "$(( 10#$code ))")"
+    fi
+    s="${s//&#${code};/$char}"
+  done
+  s="${s//&amp;/&}"
+  printf '%s' "$s"
+}
+
+# Make a server-supplied name safe to use as a local file name: no path
+# separators, no control characters, never "." or "..".
+safe_filename() {
+  local n="$1" bad='[<>:"|?*]'
+  n="$(printf '%s' "$n" | tr -d '\000-\037\177')"
+  n="${n//\//_}"
+  n="${n//\\/_}"
+  case "${OSTYPE:-}" in
+    msys* | cygwin*) n="${n//$bad/_}" ;;   # not allowed in Windows file names
+  esac
+  n="${n#"${n%%[![:space:]]*}"}"
+  n="${n%"${n##*[![:space:]]}"}"
+  [[ "$n" == "." || "$n" == ".." ]] && n=""
+  printf '%s' "$n"
+}
+
+# File name from the Content-Disposition header of a response.
+header_filename() {
+  local headers value
+  headers="$(printf '%s\n' "$1" | tr -d '\r')"
+  value="$(printf '%s\n' "$headers" \
+    | sed -n "s/^[Cc]ontent-[Dd]isposition:.*filename\*=[Uu][Tt][Ff]-8''\([^;]*\).*/\1/p" | tail -n 1)"
+  if [[ -n "$value" ]]; then
+    printf '%b' "${value//%/\\x}"   # percent-decoding
+    return 0
+  fi
+  printf '%s\n' "$headers" \
+    | sed -n 's/^[Cc]ontent-[Dd]isposition:.*filename="\([^"]*\)".*/\1/p' | tail -n 1
+}
+
+# What the two ways of locating a file hand to do_download:
+DL_NAME=""      # file name, already safe to use locally
+DL_SIZE=""      # human-readable size, may be empty
+DL_PAGE_URL=""  # file page (empty for direct links)
+DL_LINK=""      # the page's download link, still to be resolved
+DL_DIRECT=""    # URL of the file itself
+
+# probe_direct_link <url> <id>
+# A direct file link, e.g. from "Copy download link" on the file page.
+probe_direct_link() {
+  local bytes
+  DL_DIRECT="$1"
+  DL_ID="$2"
+  DL_PAGE_URL=""
+  DL_LINK=""
+  DL_SIZE=""
+  if ! http_request "" -sS -I --max-time "$API_TIMEOUT" "$DL_DIRECT"; then
+    err "Could not reach the download server (see the curl message above)."
+    return 1
+  fi
+  if ! status_ok "$HTTP_STATUS"; then
+    err "The direct link was refused (HTTP ${HTTP_STATUS})."
+    hint "Direct links expire - copy a fresh one from the file page."
+    return 1
+  fi
+  DL_NAME="$(safe_filename "$(header_filename "$RESP_BODY")")"
+  [[ -n "$DL_NAME" ]] || DL_NAME="$DL_ID"
+  bytes="$(printf '%s\n' "$RESP_BODY" | tr -d '\r' \
+    | sed -n 's/^[Cc]ontent-[Ll]ength:[[:space:]]*\([0-9][0-9]*\)$/\1/p' | tail -n 1)"
+  [[ -n "$bytes" ]] && DL_SIZE="$(human_size "$bytes")"
+  return 0
+}
+
+# read_file_page <link|id> <alt 0|1>
+# Reads name, size and the download link from the public file page.
+read_file_page() {
+  local target="$1" alt="$2" origin
+  DL_DIRECT=""
+  parse_link "$target" || { err "Not a BuzzHeavier link or file id: $target"; return 1; }
+  origin="$DL_ORIGIN"
+  DL_PAGE_URL="${origin}/${DL_ID}"
+
+  if ! http_request "" -sS --max-time "$API_TIMEOUT" "$DL_PAGE_URL"; then
+    err "Could not reach ${origin} (see the curl message above)."
+    return 1
+  fi
+  if ! status_ok "$HTTP_STATUS"; then
+    if [[ "$HTTP_STATUS" == 404 ]]; then
+      err "File not found (removed or expired?): ${DL_PAGE_URL}"
+    elif [[ "$RESP_BODY" == *"Just a moment"* ]]; then
+      err "The site answered with a browser check (HTTP ${HTTP_STATUS}) instead of the file page."
+      hint "Open ${DL_PAGE_URL} in a browser, use \"Copy download link\" there"
+      hint "and pass that link to this command instead."
+    else
+      err "Could not open ${DL_PAGE_URL}: HTTP ${HTTP_STATUS}"
+    fi
+    return 1
+  fi
+
+  DL_NAME="$(printf '%s\n' "$RESP_BODY" | sed -n 's/.*<title>\(.*\)<\/title>.*/\1/p' | head -n 1)"
+  DL_NAME="$(safe_filename "$(html_unescape "$DL_NAME")")"
+  [[ -n "$DL_NAME" ]] || DL_NAME="$DL_ID"
+  DL_SIZE="$(printf '%s\n' "$RESP_BODY" | sed -n 's/.*class="size">\([^<]*\)<.*/\1/p' | head -n 1)"
+  DL_LINK="$(printf '%s\n' "$RESP_BODY" | grep -o 'hx-get="[^"]*/download[^"]*"' | grep -v 'alt=true' | head -n 1)"
+  DL_LINK="${DL_LINK#hx-get=\"}"
+  DL_LINK="${DL_LINK%\"}"
+  DL_LINK="${DL_LINK//&amp;/&}"
+  if [[ -z "$DL_LINK" ]]; then
+    err "No download link found on ${DL_PAGE_URL}"
+    hint "Only links to single files can be downloaded (not directories)."
+    return 1
+  fi
+  case "$DL_LINK" in
+    http://* | https://*) ;;
+    /*) DL_LINK="${origin}${DL_LINK}" ;;
+    *)  DL_LINK="${origin}/${DL_LINK}" ;;
+  esac
+  if (( alt )); then
+    if [[ "$DL_LINK" == *\?* ]]; then DL_LINK+="&alt=true"; else DL_LINK+="?alt=true"; fi
+  fi
+  return 0
+}
+
+# Ask for the real file URL the way the page does; sets DL_DIRECT.
+request_direct_url() {
+  if ! http_request "" -sS -i --max-time "$API_TIMEOUT" \
+      -H "HX-Request: true" -H "Referer: ${DL_PAGE_URL}" "$DL_LINK"; then
+    err "Could not reach ${DL_ORIGIN} (see the curl message above)."
+    return 1
+  fi
+  DL_DIRECT="$(printf '%s\n' "$RESP_BODY" | tr -d '\r' \
+    | sed -n 's/^[Hh][Xx]-[Rr][Ee][Dd][Ii][Rr][Ee][Cc][Tt]:[[:space:]]*//p' | head -n 1)"
+  [[ "$DL_DIRECT" == /* ]] && DL_DIRECT="${DL_ORIGIN}${DL_DIRECT}"
+  if [[ ! "$DL_DIRECT" =~ ^https?:// || "$DL_DIRECT" == "$DL_PAGE_URL" \
+      || "$DL_DIRECT" == "${DL_PAGE_URL}/" ]]; then
+    err "The site did not hand out a download link for ${DL_NAME} (HTTP ${HTTP_STATUS})."
+    hint "It may be busy, or the site has changed. Try again, or try --alt."
+    return 1
+  fi
+  return 0
+}
+
+# do_download <link|id> <output|""> <force 0|1> <alt 0|1>
+# Prints the path of the saved file on stdout (nothing when writing to stdout).
+do_download() {
+  local target="$1" out="$2" force="$3" alt="$4"
+  local name size direct dest part rc bytes
+  local direct_re='^https?://[^/]+/d/([A-Za-z0-9_-]+)([?#].*)?$'
+
+  # 1. Find the file: its name, size and where to get it from.
+  if [[ "$target" =~ $direct_re ]]; then
+    probe_direct_link "$target" "${BASH_REMATCH[1]}" || return 1
+  else
+    read_file_page "$target" "$alt" || return 1
+  fi
+  name="$DL_NAME"
+  size="$DL_SIZE"
+
+  # 2. Where to save it. Decided before anything large is transferred.
+  if [[ "$out" == "-" ]]; then
+    dest="-"
+  elif [[ -z "$out" ]]; then
+    dest="$name"
+  elif [[ -d "$out" || "$out" == */ ]]; then
+    mkdir -p "$out" || { err "Could not create directory: $out"; return 1; }
+    dest="${out%/}/${name}"
+  else
+    dest="$out"
+  fi
+  if [[ "$dest" != "-" ]]; then
+    part="${dest}.part"
+    if [[ -d "$dest" ]]; then
+      err "A directory with that name is in the way: $dest"
+      return 1
+    fi
+    if [[ -e "$dest" ]] && (( ! force )); then
+      err "File already exists: $dest"
+      hint "Use --force to overwrite it, or -o <path> to save it somewhere else."
+      return 1
+    fi
+    (( force )) && rm -f "$part"
+  fi
+
+  # 3. A link from the file page still has to be turned into the file URL.
+  if [[ -z "$DL_DIRECT" ]]; then
+    request_direct_url || return 1
+  fi
+  direct="$DL_DIRECT"
+
+  # 4. Transfer.
+  step "Downloading ${name}${size:+ (${size})}"
+  local -a args=(--fail -L)
+  if (( OPT_QUIET )) || [[ ! -t 2 ]]; then
+    args+=(-sS)
+  else
+    args+=(-#)   # progress bar on stderr
+  fi
+
+  if [[ "$dest" == "-" ]]; then
+    if ! curl "${CURL_COMMON[@]}" "${args[@]}" "$direct"; then
+      err "Download failed: ${name}"
+      return 1
+    fi
+    ok "Downloaded ${name}"
+    return 0
+  fi
+
+  if [[ -s "$part" ]]; then
+    bytes="$(wc -c < "$part" 2>/dev/null | tr -d '[:space:]')"
+    hint "Resuming, $(human_size "${bytes:-0}") already downloaded."
+  fi
+  http_request "" "${args[@]}" -C - -o "$(native_path "$part")" "$direct"
+  rc=$?
+  # 416 on a resume means the partial file was already complete.
+  if ! { (( rc == 0 )) && status_ok "$HTTP_STATUS"; } \
+      && ! [[ "$HTTP_STATUS" == 416 && -s "$part" ]]; then
+    [[ "$HTTP_STATUS" == 000 ]] && HTTP_STATUS=""
+    err "Download failed: ${name}${HTTP_STATUS:+ (HTTP ${HTTP_STATUS})}"
+    if [[ -s "$part" ]]; then
+      hint "Partial data kept in ${part} - run the same command again to resume."
+    else
+      rm -f "$part"
+    fi
+    return 1
+  fi
+
+  mv -f -- "$part" "$dest" || { err "Could not save $dest"; return 1; }
+  bytes="$(wc -c < "$dest" 2>/dev/null | tr -d '[:space:]')"
+  ok "Saved ${dest} ($(human_size "${bytes:-0}"))"
+  printf '%s\n' "$dest"
+}
+
+# download <link|id>... [-o <file|dir>] [-f] [--alt]
+cmd_download() {
+  local synopsis="download <link|id>... [-o <file|dir>] [-f] [--alt]"
+  local out="" force=0 alt=0 target
+  local -a targets=()
+
+  while (( $# )); do
+    case "$1" in
+      -o | --output) (( $# >= 2 )) || die_usage "$synopsis"; out="$2"; shift 2 ;;
+      --output=*)    out="${1#*=}"; shift ;;
+      -f | --force)  force=1; shift ;;
+      --alt)         alt=1; shift ;;
+      -?*) err "Unknown option for download: $1"; die_usage "$synopsis" ;;
+      *) targets+=("$1"); shift ;;
+    esac
+  done
+
+  (( ${#targets[@]} >= 1 )) || die_usage "$synopsis"
+  if (( ${#targets[@]} > 1 )) && [[ -n "$out" && ! -d "$out" && "$out" != */ ]]; then
+    die "With several links, -o must name a directory."
+  fi
+
+  local failed=0 total=${#targets[@]}
+  for target in "${targets[@]}"; do
+    do_download "$target" "$out" "$force" "$alt" || failed=$(( failed + 1 ))
+  done
+  if (( total > 1 )); then
+    if (( failed )); then
+      warn "$(( total - failed )) of ${total} files downloaded, ${failed} failed."
+    else
+      ok "All ${total} files downloaded."
+    fi
+  fi
+  (( failed == 0 ))
 }
 
 ########################################
@@ -808,20 +1128,22 @@ ${C_BOLD}Buzzheavier CLI${C_RST} ${C_DIM}v${VERSION} - account ID: ${acct}${C_RS
  ${C_CYAN}Upload${C_RST}
    1) Upload a file (anonymous)
    2) Upload file(s) into a directory
+ ${C_CYAN}Download${C_RST}
+   3) Download a file from a link
  ${C_CYAN}Browse${C_RST}
-   3) List root directory
-   4) List a directory
+   4) List root directory
+   5) List a directory
  ${C_CYAN}Manage${C_RST}
-   5) Create directory
-   6) Rename file or directory
-   7) Move file or directory
-   8) Set a file note
-   9) Delete file or directory
+   6) Create directory
+   7) Rename file or directory
+   8) Move file or directory
+   9) Set a file note
+  10) Delete file or directory
  ${C_CYAN}Account${C_RST}
-  10) Account info
-  11) Storage locations
-  12) Set account ID
-  13) Show config
+  11) Account info
+  12) Storage locations
+  13) Set account ID
+  14) Show config
    q) Quit
 
 EOF
@@ -848,39 +1170,50 @@ EOF
           ( cmd_upload --dir "$a" -- "${list[@]}" )
         fi
         ;;
-      3) ( cmd_ls ) ;;
-      4)
+      3)
+        ask "Link or file id: " || break; a="$ASK_REPLY"
+        ask_path "Save to (file or directory) [current directory]: " || break
+        if [[ -z "$a" ]]; then
+          warn "A link or file id is required."
+        elif [[ -n "$ASK_REPLY" ]]; then
+          ( cmd_download "$a" -o "$ASK_REPLY" )
+        else
+          ( cmd_download "$a" )
+        fi
+        ;;
+      4) ( cmd_ls ) ;;
+      5)
         ask "Directory id: " || break
         if [[ -n "$ASK_REPLY" ]]; then ( cmd_ls "$ASK_REPLY" ); else warn "Directory id is required."; fi
         ;;
-      5)
+      6)
         ask "New directory name: " || break; a="$ASK_REPLY"
         ask "Parent directory id [root]: " || break
         ( cmd_mkdir "$a" "$ASK_REPLY" )
         ;;
-      6)
+      7)
         ask "Id of the file or directory: " || break; a="$ASK_REPLY"
         ask "New name: " || break
         ( cmd_rename "$a" "$ASK_REPLY" )
         ;;
-      7)
+      8)
         ask "Id of the file or directory: " || break; a="$ASK_REPLY"
         ask "Id of the new parent directory: " || break
         ( cmd_move "$a" "$ASK_REPLY" )
         ;;
-      8)
+      9)
         ask "File id: " || break; a="$ASK_REPLY"
         ask "Note text: " || break
         ( cmd_note "$a" "$ASK_REPLY" )
         ;;
-      9)
+      10)
         ask "Id of the file or directory to delete: " || break
         ( cmd_delete_dir "$ASK_REPLY" )
         ;;
-      10) ( cmd_account ) ;;
-      11) ( cmd_locations ) ;;
-      12) ( cmd_set_token "" ) ;;
-      13) ( cmd_config ) ;;
+      11) ( cmd_account ) ;;
+      12) ( cmd_locations ) ;;
+      13) ( cmd_set_token "" ) ;;
+      14) ( cmd_config ) ;;
       q | Q | quit | exit) break ;;
       "") ;;
       *) warn "Unknown option: $choice" ;;
@@ -908,6 +1241,16 @@ ${O_BOLD}UPLOAD${O_RST}
         -n, --name <name>         store under another name (single file only)
         -l, --location <id>       storage location (see: ${PROG} locations)
         -N, --note <text>         note shown under the download link
+
+${O_BOLD}DOWNLOAD${O_RST}
+  ${O_CYAN}download${O_RST} <link|id>... [-o <file|dir>] [-f] [--alt]
+      Download files from BuzzHeavier links and print where they were saved.
+        -o, --output <path>       file name, or a directory to save into;
+                                  "-" writes the file to stdout
+        -f, --force               overwrite an existing file
+            --alt                 use the alternative download server
+      Run the same command again to resume an interrupted download.
+      Direct links ("Copy download link" on a file page) work as well.
 
 ${O_BOLD}FILE MANAGER${O_RST} ${O_DIM}(needs account ID)${O_RST}
   ${O_CYAN}ls${O_RST} [dirId]                    List the root or the given directory
@@ -946,6 +1289,7 @@ ${O_BOLD}EXAMPLES${O_RST}
   ${PROG} upload *.zip -d <dirId>
   ${PROG} upload report.pdf --note "final version" -l <locationId>
   link=\$(${PROG} -q upload backup.tar.gz)
+  ${PROG} download https://buzzheavier.com/<id> -o ~/Downloads/
   ${PROG} ls --json | jq '.data.children[].name'
 
 ${O_BOLD}LEGACY COMMAND NAMES${O_RST} ${O_DIM}(still supported)${O_RST}
@@ -1027,6 +1371,9 @@ main() {
     upload-loc)  cmd_upload_loc "${rest[@]}" ;;
     upload-note) cmd_upload_note "${rest[@]}" ;;
     bulk-upload) cmd_bulk_upload "${rest[@]}" ;;
+
+    # Downloads
+    download | dl | get) cmd_download "${rest[@]}" ;;
 
     # Public / account
     locations)        cmd_locations ;;
