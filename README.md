@@ -91,6 +91,8 @@ Related commands:
 | `BUZZHEAVIER_API_BASE`      | default: `https://buzzheavier.com/api`          |
 | `BUZZHEAVIER_UPLOAD_BASE`   | default: `https://w.buzzheavier.com`            |
 | `BUZZHEAVIER_DOWNLOAD_BASE` | default: `https://buzzheavier.com`              |
+| `BUZZHEAVIER_DOWNLOADER`    | `auto` (default), `cffi` or `curl`              |
+| `BUZZHEAVIER_IMPERSONATE`   | browser for curl_cffi, default: `chrome`        |
 | `NO_COLOR`                  | set to any value to disable colours             |
 
 ---
@@ -172,7 +174,7 @@ $ ./buzzheavier.sh download https://buzzheavier.com/abc123def456 -o ~/Downloads/
 - **File names** come from the server and are cleaned up before use: path separators and control characters are removed, so a file can only ever land in the directory you chose.
 - **Only single files:** links to directories are not supported.
 
-> BuzzHeavier has no download API, so this command reads the public file page the same way a browser does. The site sometimes answers automated clients with a browser check instead of the page; the CLI then stops with an explanation rather than trying to get around it. In testing this depended on the `curl` build: `curl` on Windows (Git Bash) got through, `curl` on Linux (WSL) was blocked. If the site changes its pages, this command may need an update.
+> BuzzHeavier has no download API, so this command reads the public file page the same way a browser does. The site often answers plain `curl` with a browser check (HTTP 403) instead of the page - in testing, 7 of 10 requests. With [`curl_cffi`](https://github.com/lexiforest/curl_cffi) installed (`pip install curl_cffi`), downloads are sent with a real browser's TLS fingerprint and got through 10 of 10 times; without it the CLI falls back to `curl`. If a browser check still comes back, the CLI stops with an explanation. If the site changes its pages, this command may need an update.
 
 **When the browser check gets in the way**, open the file page in your browser, click **Copy download link** and give that direct link to the CLI. It skips the file page entirely, and name detection, `-o`, `--force` and resume work the same:
 
@@ -271,7 +273,7 @@ The account ID is passed to `curl` on standard input rather than as a command-li
 ```
 
 ```text
-Buzzheavier CLI v2.1.0 - account ID: ab…wxyz
+Buzzheavier CLI v2.2.0 - account ID: ab…wxyz
 
  Upload
    1) Upload a file (anonymous)
@@ -333,6 +335,7 @@ Differences from version 1 that scripts may notice:
 - `jq` *(optional)* - formatted tables and `mkdir` without a parent ID
 - `base64` **or** `openssl` - only for upload notes
 - `grep`, `sed`, `tr` - only for downloads (present on any Unix-like system)
+- Python 3 with [`curl_cffi`](https://github.com/lexiforest/curl_cffi) *(optional, recommended for downloads)* - `pip install curl_cffi`. When it is installed, downloads are sent with a real browser's TLS fingerprint, which the site's browser check blocks far less often than plain `curl` (plain `curl` got HTTP 403 where `curl_cffi` got the page). Without it, downloads fall back to `curl`. `BUZZHEAVIER_DOWNLOADER=auto|cffi|curl` forces a transport, `BUZZHEAVIER_IMPERSONATE` (default `chrome`) picks the browser to imitate.
 
 Tested with Bash 5 on Linux and on Windows (Git Bash and WSL). The script avoids Bash 4+ only features, so the Bash 3.2 that ships with macOS should work too.
 

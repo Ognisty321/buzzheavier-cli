@@ -8,6 +8,8 @@
 #   - jq (optional: formatted tables; without it raw JSON is printed)
 #   - base64 or openssl (only for upload notes)
 #   - grep, sed, tr (only for downloads)
+#   - python3 + curl_cffi (optional, recommended for downloads: requests look
+#     like a real browser, so the site's browser check blocks them far less)
 #
 # Output contract:
 #   - results (download links, tables, JSON) go to stdout
@@ -15,7 +17,7 @@
 #   - exit code: 0 success, 1 failure (network / API error), 2 usage error
 #
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 PROG="${0##*/}"
 
 set -o pipefail
@@ -588,6 +590,236 @@ cmd_bulk_upload() {
 # short-lived link; requesting that link the way the page does (as an htmx
 # request) answers with an HX-Redirect header pointing at the real file.
 # A direct file link copied in a browser skips both steps.
+#
+# All download requests go through dl_fetch. When Python with curl_cffi is
+# available it sends them with a real browser's TLS/HTTP2 fingerprint (the site
+# often answers plain curl with a browser check); otherwise plain curl is used.
+# BUZZHEAVIER_DOWNLOADER=auto|cffi|curl picks the transport,
+# BUZZHEAVIER_IMPERSONATE the browser curl_cffi pretends to be.
+
+DOWNLOADER="${BUZZHEAVIER_DOWNLOADER:-auto}"
+IMPERSONATE="${BUZZHEAVIER_IMPERSONATE:-chrome}"
+DL_BACKEND=""   # cffi | curl, decided once by pick_backend
+CFFI_PY=""      # Python interpreter that has curl_cffi
+DL_COOKIES=""   # cookie jar shared by the requests of one run (cffi only)
+
+# The curl_cffi side of dl_fetch. Same options as dl_fetch, plus --cookies,
+# --impersonate and --connect-timeout. Prints like curl -w '\n%{http_code}'
+# (nothing extra with "--out -") and exits with curl-style codes.
+read -r -d '' CFFI_HELPER <<'PYEOF'
+import sys
+sys.path[:] = [p for p in sys.path if p not in ("", ".")]  # never import from the cwd
+import json, os, time
+try:
+    from curl_cffi import requests
+except Exception as e:
+    sys.stderr.write("curl_cffi: cannot be loaded (%s)\n" % e)
+    sys.exit(2)
+
+head = include = location = resume = progress = fail = False
+out = cookie_file = url = max_time = None
+connect_timeout = 20.0
+impersonate = "chrome"
+headers = {}
+it = iter(sys.argv[1:])
+for a in it:
+    if a == "--head": head = True
+    elif a == "--include": include = True
+    elif a == "--location": location = True
+    elif a == "--resume": resume = True
+    elif a == "--progress": progress = True
+    elif a == "--fail": fail = True
+    elif a == "--out": out = next(it)
+    elif a == "--header":
+        k, _, v = next(it).partition(":")
+        headers[k.strip()] = v.strip()
+    elif a == "--max-time": max_time = float(next(it))
+    elif a == "--connect-timeout": connect_timeout = float(next(it))
+    elif a == "--cookies": cookie_file = next(it)
+    elif a == "--impersonate": impersonate = next(it)
+    else: url = a
+
+to_file = out not in (None, "-")
+status = 0
+session = requests.Session(impersonate=impersonate)
+
+if cookie_file and os.path.exists(cookie_file):
+    try:
+        with open(cookie_file, encoding="utf-8") as f:
+            for name, value, domain, path in json.load(f):
+                session.cookies.set(name, value, domain=domain, path=path)
+    except Exception:
+        pass
+
+def finish(code):
+    if out != "-":
+        sys.stdout.buffer.write(b"\n%03d" % status)  # 000 = no answer, as in curl
+    sys.stdout.flush()
+    if cookie_file:
+        try:
+            jar = [[c.name, c.value, c.domain, c.path] for c in session.cookies.jar]
+            with open(cookie_file, "w", encoding="utf-8") as f:
+                json.dump(jar, f)
+        except Exception:
+            pass
+    sys.exit(code)
+
+def fail_with(e):
+    code = getattr(e, "code", None)
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = 28 if isinstance(e, requests.exceptions.Timeout) else 7
+    sys.stderr.write("curl_cffi: %s\n" % e)
+    finish(code or 7)
+
+offset = 0
+if resume and to_file and os.path.exists(out):
+    offset = os.path.getsize(out)
+    if offset:
+        headers["Range"] = "bytes=%d-" % offset
+
+# Whole-request limit for page/API calls; downloads only give up when stalled.
+timeout = max_time if max_time else (connect_timeout, 120)
+try:
+    r = session.request("HEAD" if head else "GET", url, headers=headers,
+                        allow_redirects=location, timeout=timeout, stream=True)
+except Exception as e:
+    fail_with(e)
+status = r.status_code
+
+if fail and status >= 400:
+    r.close()
+    finish(22)
+
+w = sys.stdout.buffer
+try:
+    if include or head:
+        lines = ["HTTP/1.1 %d %s" % (status, r.reason or "")]
+        lines += ["%s: %s" % kv for kv in r.headers.multi_items()]
+        w.write(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8", "replace"))
+    if head:
+        r.close()
+        finish(0)
+    if not to_file:
+        for chunk in r.iter_content(chunk_size=65536):
+            w.write(chunk)
+        finish(0)
+
+    if status != 206:
+        offset = 0  # the server sent the whole file
+    total = int(r.headers.get("content-length") or 0)
+    total = total + offset if total else 0
+    done, last = offset, 0.0
+    def bar(final=False):
+        if total:
+            pct = min(done * 100.0 / total, 100.0)
+            hashes = "#" * int(pct * 0.6)
+            sys.stderr.write("\r%-60s %5.1f%%" % (hashes, pct))
+        else:
+            sys.stderr.write("\r%d bytes" % done)
+        if final:
+            sys.stderr.write("\n")
+        sys.stderr.flush()
+    with open(out, "ab" if offset else "wb") as f:
+        for chunk in r.iter_content(chunk_size=65536):
+            f.write(chunk)
+            done += len(chunk)
+            if progress and time.time() - last > 0.2:
+                last = time.time()
+                bar()
+    if progress:
+        bar(final=True)
+except Exception as e:
+    if progress:
+        sys.stderr.write("\n")
+    fail_with(e)
+finish(0)
+PYEOF
+
+# Decide once per run whether downloads use curl_cffi or plain curl.
+pick_backend() {
+  [[ -n "$DL_BACKEND" ]] && return 0
+  local c probe='import sys; sys.path[:] = [p for p in sys.path if p not in ("", ".")]; import curl_cffi'
+  case "$DOWNLOADER" in
+    curl) DL_BACKEND="curl"; return 0 ;;
+    auto | cffi | curl_cffi) ;;
+    *)
+      err "BUZZHEAVIER_DOWNLOADER must be auto, cffi or curl (got: ${DOWNLOADER})"
+      return 1
+      ;;
+  esac
+  for c in python3 python py; do
+    if have "$c" && "$c" -c "$probe" >/dev/null 2>&1; then
+      CFFI_PY="$c"
+      DL_BACKEND="cffi"
+      DL_COOKIES="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/buzzheavier-cookies.$$")"
+      trap '[[ -n "$DL_COOKIES" ]] && rm -f "$DL_COOKIES"' EXIT
+      return 0
+    fi
+  done
+  if [[ "$DOWNLOADER" != auto ]]; then
+    err "curl_cffi is not available (BUZZHEAVIER_DOWNLOADER=${DOWNLOADER})."
+    hint "Install it with: pip install curl_cffi"
+    return 1
+  fi
+  DL_BACKEND="curl"
+  hint "curl_cffi not found, downloading with plain curl (pip install curl_cffi to look like a browser)."
+}
+
+# dl_fetch [--head] [--include] [--location] [--fail] [--resume] [--progress]
+#          [--max-time <s>] [--header <h>]... [--out <file|->] <url>
+# Like http_request: sets HTTP_STATUS (and RESP_BODY without --out) and
+# returns the transport's exit code. With "--out -" the body goes to stdout.
+dl_fetch() {
+  pick_backend || return 1
+  local -a cargs=() pargs=()
+  local out="" url="" progress=0 rc
+  while (( $# )); do
+    case "$1" in
+      --head)     cargs+=(-I);     pargs+=(--head) ;;
+      --include)  cargs+=(-i);     pargs+=(--include) ;;
+      --location) cargs+=(-L);     pargs+=(--location) ;;
+      --fail)     cargs+=(--fail); pargs+=(--fail) ;;
+      --resume)   cargs+=(-C -);   pargs+=(--resume) ;;
+      --progress) progress=1;      pargs+=(--progress) ;;
+      --max-time) cargs+=(--max-time "$2"); pargs+=(--max-time "$2"); shift ;;
+      --header)   cargs+=(-H "$2");         pargs+=(--header "$2"); shift ;;
+      --out)      out="$2"; shift ;;
+      *)          url="$1" ;;
+    esac
+    shift
+  done
+  if (( progress )); then cargs+=(-#); else cargs+=(-sS); fi
+
+  HTTP_STATUS=""
+  RESP_BODY=""
+  if [[ "$DL_BACKEND" == curl ]]; then
+    if [[ "$out" == "-" ]]; then
+      curl "${CURL_COMMON[@]}" "${cargs[@]}" "$url"
+      return
+    fi
+    [[ -n "$out" ]] && cargs+=(-o "$(native_path "$out")")
+    http_request "" "${cargs[@]}" "$url"
+    return
+  fi
+
+  pargs+=(--impersonate "$IMPERSONATE" --connect-timeout "$CONNECT_TIMEOUT"
+          --cookies "$(native_path "$DL_COOKIES")")
+  if [[ "$out" == "-" ]]; then
+    "$CFFI_PY" -c "$CFFI_HELPER" "${pargs[@]}" --out - "$url"
+    return
+  fi
+  [[ -n "$out" ]] && pargs+=(--out "$(native_path "$out")")
+  local res
+  res=$("$CFFI_PY" -c "$CFFI_HELPER" "${pargs[@]}" "$url")
+  rc=$?
+  HTTP_STATUS="${res##*$'\n'}"
+  [[ "$HTTP_STATUS" =~ ^[0-9]+$ ]] || HTTP_STATUS="000"
+  (( rc == 0 )) || return "$rc"
+  RESP_BODY="${res%$'\n'*}"
+  return 0
+}
 
 DL_ORIGIN=""
 DL_ID=""
@@ -680,8 +912,8 @@ probe_direct_link() {
   DL_PAGE_URL=""
   DL_LINK=""
   DL_SIZE=""
-  if ! http_request "" -sS -I --max-time "$API_TIMEOUT" "$DL_DIRECT"; then
-    err "Could not reach the download server (see the curl message above)."
+  if ! dl_fetch --head --max-time "$API_TIMEOUT" "$DL_DIRECT"; then
+    err "Could not reach the download server (see the message above)."
     return 1
   fi
   if ! status_ok "$HTTP_STATUS"; then
@@ -706,8 +938,8 @@ read_file_page() {
   origin="$DL_ORIGIN"
   DL_PAGE_URL="${origin}/${DL_ID}"
 
-  if ! http_request "" -sS --max-time "$API_TIMEOUT" "$DL_PAGE_URL"; then
-    err "Could not reach ${origin} (see the curl message above)."
+  if ! dl_fetch --max-time "$API_TIMEOUT" "$DL_PAGE_URL"; then
+    err "Could not reach ${origin} (see the message above)."
     return 1
   fi
   if ! status_ok "$HTTP_STATUS"; then
@@ -749,9 +981,9 @@ read_file_page() {
 
 # Ask for the real file URL the way the page does; sets DL_DIRECT.
 request_direct_url() {
-  if ! http_request "" -sS -i --max-time "$API_TIMEOUT" \
-      -H "HX-Request: true" -H "Referer: ${DL_PAGE_URL}" "$DL_LINK"; then
-    err "Could not reach ${DL_ORIGIN} (see the curl message above)."
+  if ! dl_fetch --include --max-time "$API_TIMEOUT" \
+      --header "HX-Request: true" --header "Referer: ${DL_PAGE_URL}" "$DL_LINK"; then
+    err "Could not reach ${DL_ORIGIN} (see the message above)."
     return 1
   fi
   DL_DIRECT="$(printf '%s\n' "$RESP_BODY" | tr -d '\r' \
@@ -815,15 +1047,13 @@ do_download() {
 
   # 4. Transfer.
   step "Downloading ${name}${size:+ (${size})}"
-  local -a args=(--fail -L)
-  if (( OPT_QUIET )) || [[ ! -t 2 ]]; then
-    args+=(-sS)
-  else
-    args+=(-#)   # progress bar on stderr
+  local -a args=(--fail --location)
+  if ! (( OPT_QUIET )) && [[ -t 2 ]]; then
+    args+=(--progress)   # progress bar on stderr
   fi
 
   if [[ "$dest" == "-" ]]; then
-    if ! curl "${CURL_COMMON[@]}" "${args[@]}" "$direct"; then
+    if ! dl_fetch "${args[@]}" --out - "$direct"; then
       err "Download failed: ${name}"
       return 1
     fi
@@ -835,7 +1065,7 @@ do_download() {
     bytes="$(wc -c < "$part" 2>/dev/null | tr -d '[:space:]')"
     hint "Resuming, $(human_size "${bytes:-0}") already downloaded."
   fi
-  http_request "" "${args[@]}" -C - -o "$(native_path "$part")" "$direct"
+  dl_fetch "${args[@]}" --resume --out "$part" "$direct"
   rc=$?
   # 416 on a resume means the partial file was already complete.
   if ! { (( rc == 0 )) && status_ok "$HTTP_STATUS"; } \
@@ -1283,6 +1513,8 @@ ${O_BOLD}ENVIRONMENT${O_RST}
   BUZZHEAVIER_API_BASE        default: https://buzzheavier.com/api
   BUZZHEAVIER_UPLOAD_BASE     default: https://w.buzzheavier.com
   BUZZHEAVIER_DOWNLOAD_BASE   default: https://buzzheavier.com
+  BUZZHEAVIER_DOWNLOADER      auto (default: curl_cffi if installed, else curl) | cffi | curl
+  BUZZHEAVIER_IMPERSONATE     browser curl_cffi imitates, default: chrome
 
 ${O_BOLD}EXAMPLES${O_RST}
   ${PROG} upload video.mp4
